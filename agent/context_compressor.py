@@ -3435,6 +3435,119 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         tail = content[-tail_chars:].lstrip() if tail_chars else ""
         return content[:head_chars].rstrip() + marker + tail
 
+    def _split_turns_for_summary(
+        self,
+        turns: List[Dict[str, Any]],
+    ) -> List[List[Dict[str, Any]]]:
+        """Group whole turns into bounded summarizer passes.
+
+        ``_serialize_for_summary`` already applies the intentional per-message
+        content and tool-argument limits. This splitter prevents the later
+        aggregate bound from dropping the middle of that serialized source.
+        Normal turns stay intact. A pathological single turn that still
+        exceeds the aggregate limit (for example, an assistant message with
+        thousands of tool calls) is represented as ordered assistant-role
+        source fragments so it cannot be mistaken for user-authored input.
+        """
+        limit = self._SUMMARY_INPUT_MAX_CHARS
+        chunks: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        current_chars = 0
+
+        for turn in turns:
+            rendered = self._serialize_for_summary([turn])
+            parts: List[Dict[str, Any]] = [turn]
+            if len(rendered) > limit:
+                # Keep fragment bodies below the normal per-message body cap so
+                # serializing them again cannot truncate the preserved source.
+                digits = len(str(len(rendered)))
+                header_probe = (
+                    "[Oversized historical turn, part "
+                    f"{'9' * digits}/{'9' * digits}; source material only]\n"
+                )
+                overhead = len(
+                    self._serialize_for_summary(
+                        [{"role": "assistant", "content": header_probe}]
+                    )
+                )
+                payload_chars = max(1, min(self._CONTENT_HEAD, limit - overhead))
+                total_parts = (
+                    len(rendered) + payload_chars - 1
+                ) // payload_chars
+                parts = [
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "[Oversized historical turn, part "
+                            f"{part_index}/{total_parts}; source material only]\n"
+                            + rendered[offset:offset + payload_chars]
+                        ),
+                    }
+                    for part_index, offset in enumerate(
+                        range(0, len(rendered), payload_chars),
+                        start=1,
+                    )
+                ]
+
+            for part in parts:
+                part_chars = len(self._serialize_for_summary([part]))
+                separator_chars = 2 if current else 0
+                if (
+                    current
+                    and current_chars + separator_chars + part_chars > limit
+                ):
+                    chunks.append(current)
+                    current = []
+                    current_chars = 0
+                    separator_chars = 0
+                current.append(part)
+                current_chars += separator_chars + part_chars
+
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _generate_summary_in_passes(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        focus_topic: Optional[str] = None,
+        memory_context: str = "",
+    ) -> Optional[str]:
+        """Summarize every bounded pass, committing only the final result."""
+        chunks = self._split_turns_for_summary(turns_to_summarize)
+        telemetry = getattr(self, "_active_compression_telemetry", None)
+        if isinstance(telemetry, dict):
+            telemetry["chunking"] = len(chunks) > 1
+            telemetry["chunk_count"] = len(chunks)
+
+        # Match _generate_summary's strict iterative-input boundary before
+        # taking the rollback snapshot. A failed later pass must not restore a
+        # legacy pre-redaction summary.
+        if self._previous_summary:
+            self._previous_summary = _redact_compaction_text(
+                self._previous_summary
+            )
+        previous_summary = self._previous_summary
+        summary: Optional[str] = None
+        committed = False
+        try:
+            for chunk in chunks:
+                summary = self._generate_summary(
+                    chunk,
+                    focus_topic=focus_topic,
+                    memory_context=memory_context,
+                )
+                if not summary:
+                    return None
+            committed = True
+            return summary
+        finally:
+            if not committed:
+                # Successful earlier passes are tentative iterative state. A
+                # later failure or interruption must not commit a partial view
+                # of the source.
+                self._previous_summary = previous_summary
+
     def _fallback_to_main_for_compression(self, e: Exception, reason: str) -> None:
         """Switch from a separate ``summary_model`` back to the main model.
 
@@ -6263,7 +6376,6 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
 
         # Phase 3: Generate structured summary
-
         # Pre-LLM feasibility check: if the middle section is too small to
         # yield meaningful token savings, skip the expensive LLM summarization
         # call and fall through to the deterministic message-dropping path
@@ -6318,7 +6430,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             # for it when a summary will actually be generated.
             summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
             try:
-                summary = self._generate_summary(
+                summary = self._generate_summary_in_passes(
                     turns_to_summarize,
                     focus_topic=summary_focus_topic,
                     memory_context=memory_context,
