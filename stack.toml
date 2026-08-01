@@ -1,0 +1,40 @@
+schema = 2
+
+[upstream]
+repo = "https://github.com/NousResearch/hermes-agent"
+sha = "470cf66b039c73bdd2c21d43094ce41a4db74eae"
+pinned_at = "2026-08-01"
+
+# Ordered by reviewed dependency, not by PR number.
+[[entry]]
+index = 1
+kind = "upstream-pr"
+id = 74379
+title = "feat(hindsight): memory provider improvements — recall_sync, retain_source, setup templates, memory indicators, error hints"
+fetch_repo = "https://github.com/NousResearch/hermes-agent"
+fetch_ref = "refs/pull/74379/head"
+retention_tag = "pr/74379/head-c778c87f9bc0d8f915315df7c45e1a30ed98a8b8"
+contributor_repo = "https://github.com/benfrank241/hermes-agent"
+contributor_ref = "feat/hindsight-memory-improvements"
+head_sha = "c778c87f9bc0d8f915315df7c45e1a30ed98a8b8"
+materialization = "pending-phase-2"
+head_tree = "pending-phase-2"
+patch_base = "8defb9fd60bebe2802eaab7c57fa2ee6a4ff6281"
+patch_file = "pending-phase-2"
+patch_sha256 = "pending-phase-2"
+changed_paths = []
+order_rationale = "first: the upstream change the owned follow-up depends on"
+
+[[entry]]
+index = 2
+kind = "owned-followup"
+title = "generic gateway retain feedback on top of PR 74379"
+spec = "FOLLOWUP.md"
+materialization = "pending-phase-2"
+retention_tag = "pending-phase-2"
+head_sha = "pending-phase-2"
+head_tree = "pending-phase-2"
+patch_base = "pending-phase-2"
+changed_paths = []
+depends_on = [1]
+order_rationale = "modifies call sites introduced by entry 1"
