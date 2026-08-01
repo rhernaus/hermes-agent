@@ -1,0 +1,1693 @@
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 407f9a6c7b4b6cbd59f19b41ae191edbae965cb5..dee6689395530c859cf2ddab68819e8037c084b3 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -60,6 +60,40 @@ from utils import base_url_host_matches, is_truthy_value
+ logger = logging.getLogger("run_agent")
+ 
+ 
++# Memory providers we've already warned are unavailable. Deduped because the
++# gateway builds a fresh AIAgent per message, so an un-deduped warning would
++# fire on every turn.
++_warned_unavailable_providers: set[str] = set()
++
++
++def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
++    """Warn (once per provider) when a configured memory provider is unavailable.
++
++    ``is_available()`` is a fast, side-effect-free hot-path check, so it can't
++    log for itself. Without this warning a provider whose credentials/config are
++    missing is silently dropped — the user has ``memory.provider`` set but gets
++    no memory and no diagnostic. A common trigger is systemd/gateway services
++    not inheriting ``~/.hermes/.env``. See NousResearch/hermes-agent#2765.
++
++    ``reason`` is the provider's ``unavailable_reason()`` — a provider-specific,
++    actionable hint (e.g. which package to install). Because an unavailable
++    provider is never initialized, this is the only place such a hint can reach
++    the user, so it is appended to the warning when present (#7718).
++    """
++    if name in _warned_unavailable_providers:
++        return
++    _warned_unavailable_providers.add(name)
++    logger.warning(
++        "Memory provider %r is selected but reports unavailable — external memory "
++        "is disabled for this session (built-in memory still works). Check the "
++        "provider's credentials/config with 'hermes memory status'. Note: "
++        "systemd/gateway services do not inherit ~/.hermes/.env automatically; set "
++        "any required variables in the service environment.%s",
++        name,
++        f" {reason}" if reason else "",
++    )
++
++
+ def _ra():
+     """Lazy reference to ``run_agent`` so callers can patch
+     ``run_agent.OpenAI`` / ``run_agent.cleanup_vm`` / ... and have those
+@@ -1645,6 +1679,12 @@ def init_agent(
+                 _mp = _load_mem(_mem_provider_name)
+                 if _mp and _mp.is_available():
+                     agent._memory_manager.add_provider(_mp)
++                elif _mp is not None:
++                    try:
++                        _unavailable_reason = _mp.unavailable_reason()
++                    except Exception:
++                        _unavailable_reason = ""
++                    _warn_memory_provider_unavailable(_mem_provider_name, _unavailable_reason)
+                 if agent._memory_manager.providers:
+                     _init_kwargs = {
+                         "session_id": agent.session_id,
+@@ -1690,6 +1730,10 @@ def init_agent(
+                         _init_kwargs["agent_workspace"] = "hermes"
+                     except Exception:
+                         pass
++                    # NOTE: status_callback (for the deterministic retain
++                    # indicator) is wired above, CLI-only — gateway status is
++                    # delivered on a different path (see the platform=="cli"
++                    # block), and the indicator no-ops when it's absent.
+                     agent._memory_manager.initialize_all(**_init_kwargs)
+                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
+                 else:
+diff --git a/agent/memory_manager.py b/agent/memory_manager.py
+index 6f3bbadd6f0591b19b0fb98f34f39f655e376e8f..61a5182b8e4abb63d7498f2812f46c93b3e88067 100644
+--- a/agent/memory_manager.py
++++ b/agent/memory_manager.py
+@@ -594,6 +594,38 @@ class MemoryManager:
+             raise error_box["value"]
+         return result_box.get("value", "")
+ 
++    def describe_recall(self) -> str:
++        """Build a deterministic, model-independent recall indicator line.
++
++        Call right after :meth:`prefetch_all` on the turn thread. Collects each
++        provider's :meth:`MemoryProvider.recall_status` and renders a single
++        status string (e.g. ``"👁️ Hindsight — recalled 3 memories"``) so the
++        user SEES memory was used regardless of whether the model mentions it.
++        Returns ``""`` when no provider injected memory this turn — callers can
++        emit the result unconditionally.
++        """
++        segments: List[str] = []
++        for provider in self._providers:
++            try:
++                status = provider.recall_status()
++            except Exception as e:
++                logger.debug(
++                    "Memory provider '%s' recall_status failed (non-fatal): %s",
++                    provider.name, e,
++                )
++                continue
++            if status is None:
++                continue
++            if status.count == 1:
++                detail = "recalled 1 memory"
++            elif status.count > 1:
++                detail = f"recalled {status.count} memories"
++            else:
++                # count <= 0 → content injected but no discrete count (reflect).
++                detail = "recalled relevant memory"
++            segments.append(f"{status.glyph} {status.provider_label} — {detail}")
++        return "  ".join(segments)
++
+     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
+         """Queue background prefetch on all providers for the next turn.
+ 
+diff --git a/agent/memory_provider.py b/agent/memory_provider.py
+index 4210a4c252e5e21937fecc0d7ff7a107470fee5a..e49d8fe38f6a454f56e1835c85d72876073e101e 100644
+--- a/agent/memory_provider.py
++++ b/agent/memory_provider.py
+@@ -35,10 +35,34 @@ from __future__ import annotations
+ 
+ import logging
+ from abc import ABC, abstractmethod
++from dataclasses import dataclass
+ from typing import Any, Dict, List, Optional
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Default glyph for the deterministic memory indicators. Hindsight's brand mark
++# is an eye (the logo is an eye ringed by graph nodes), so the terminal-safe
++# stand-in for the logo is the eye emoji. Providers can override per-status.
++INDICATOR_GLYPH = "👁️"
++
++
++@dataclass(frozen=True)
++class RecallStatus:
++    """Summary of what a provider's most recent prefetch injected this turn.
++
++    Returned by :meth:`MemoryProvider.recall_status` so the agent can emit a
++    deterministic, model-independent "memory was used" indicator (see
++    ``MemoryManager.describe_recall``). ``count`` is the number of discrete
++    memories injected; ``0`` means content was injected but has no discrete
++    count (e.g. a synthesized reflect answer), which the indicator renders
++    generically rather than as "0 memories". ``glyph`` is the brand mark the
++    indicator leads with.
++    """
++
++    provider_label: str
++    count: int
++    glyph: str = INDICATOR_GLYPH
++
+ 
+ class MemoryProvider(ABC):
+     """Abstract base class for memory providers."""
+@@ -82,6 +106,17 @@ class MemoryProvider(ABC):
+           - user_id_alt (str): Optional alternate stable platform user identifier.
+         """
+ 
++    def unavailable_reason(self) -> str:
++        """Actionable reason this provider reports unavailable, for the caller.
++
++        ``is_available()`` gates initialization, so a provider that reports
++        unavailable is never initialized — any diagnostic it would log from
++        ``initialize()`` is unreachable. Return a short, user-facing hint here
++        (e.g. which package to install) so the caller's "provider unavailable"
++        warning can surface it. Empty string (the default) adds nothing.
++        """
++        return ""
++
+     def system_prompt_block(self) -> str:
+         """Return text to include in the system prompt.
+ 
+@@ -113,6 +148,19 @@ class MemoryProvider(ABC):
+         that do background prefetching should override this.
+         """
+ 
++    def recall_status(self) -> Optional[RecallStatus]:
++        """Describe what the most recent :meth:`prefetch` injected, for the UI.
++
++        Called by the agent right after prefetch, on the same (single) turn
++        thread, so it can surface a deterministic "👁️ recalled N memories"
++        status line that does not depend on the model choosing to mention it.
++
++        Return ``None`` (the default) when this provider injected nothing this
++        turn or does not want a visible indicator. Providers that override it
++        must reflect only the LAST prefetch — never a stale prior count.
++        """
++        return None
++
+     def sync_turn(
+         self,
+         user_content: str,
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index e080d6a5d9692679c2c93e3d16b41a6c997675d7..16517421366fb67a74268de19ec1916369a7c592 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -1159,6 +1159,17 @@ def build_turn_context(
+             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+         except Exception:
+             pass
++        # Deterministic, model-independent recall indicator: when memory was
++        # actually injected this turn, tell the user — don't rely on the model
++        # to surface it. Rendered by Hermes (via _emit_status), so it always
++        # shows and can't be silently dropped by the model.
++        if ext_prefetch_cache:
++            try:
++                _recall_indicator = agent._memory_manager.describe_recall()
++                if _recall_indicator:
++                    agent._emit_status(_recall_indicator)
++            except Exception:
++                pass
+ 
+     # ── api_content sidecar: persist what you send ──
+     # The prefetch/plugin context above is injected into the API copy of this
+diff --git a/hermes_cli/memory_setup.py b/hermes_cli/memory_setup.py
+index 887ad1497855b4b01dace987c27c8e4973ff8ea3..0087d61fd5aeacbc3b2a7fee6e70e31719d3acd1 100644
+--- a/hermes_cli/memory_setup.py
++++ b/hermes_cli/memory_setup.py
+@@ -546,6 +546,12 @@ def cmd_status(args) -> None:
+                         if url and not is_set:
+                             line += f"  → {url}"
+                         print(line)
++                print(
++                    "  Note: systemd/gateway services do not inherit ~/.hermes/.env —"
++                )
++                print(
++                    "        set any variables above in the service environment."
++                )
+         else:
+             print("\n  Plugin:    NOT installed ✗")
+             print(f"  Install the '{provider_name}' memory plugin to ~/.hermes/plugins/")
+diff --git a/plugins/memory/hindsight/README.md b/plugins/memory/hindsight/README.md
+index be2e24528bbf8e75780e21e16d744c62a17a6c9f..fc9e166ea2dfd0bd49961d34ad6002fdb581bc49 100644
+--- a/plugins/memory/hindsight/README.md
++++ b/plugins/memory/hindsight/README.md
+@@ -14,7 +14,7 @@ Long-term memory with knowledge graph, entity resolution, and multi-strategy ret
+ hermes memory setup    # select "hindsight"
+ ```
+ 
+-The setup wizard will install dependencies automatically via `uv` and walk you through configuration.
++The setup wizard installs dependencies automatically via `uv`, walks you through configuration, and offers to seed the bank with a **starter memory template** (a curated set of dispositions/instructions for common agent roles) — you can skip it, and it warns before overwriting an already-configured bank.
+ 
+ Or manually (cloud mode with defaults):
+ ```bash
+@@ -77,6 +77,8 @@ Config file: `~/.hermes/hindsight/config.json`
+ | `recall_tags_match` | `any` | Tag matching mode: `any` / `all` / `any_strict` / `all_strict` |
+ | `recall_types` | `observation` | Fact types surfaced by recall (both auto-recall and the `hindsight_recall` tool). Comma-separated string or JSON list. **Default narrowed to `observation` only** (see "Behavior change" below). Set to `observation,world,experience` to also include raw facts. |
+ | `auto_recall` | `true` | Automatically recall memories before each turn |
++| `recall_sync` | `false` | Recall synchronously against the *current* message each turn (higher relevance, adds recall latency). Default off: recall runs in the background and is injected on the next turn. |
++| `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
+ 
+ > **Behavior change — `recall_types` defaults to `observation` only.**
+ >
+@@ -95,7 +97,8 @@ Config file: `~/.hermes/hindsight/config.json`
+ | `retain_every_n_turns` | `1` | Retain every N turns (1 = every turn) |
+ | `retain_context` | `conversation between Hermes Agent and the User` | Context label for retained memories |
+ | `retain_tags` | — | Default tags applied to retained memories; merged with per-call tool tags |
+-| `retain_source` | — | Optional `metadata.source` attached to retained memories |
++| `retain_source` | — | Opt-in `metadata.source` attached to retained memories (identifies the storing client, e.g. `hermes`). Empty by default — no attribution tag ships unless you set it. |
++| `retain_indicator` | `true` | Show a `👁️ Hindsight — saving to memory…` status line when a turn is saved. Turn off for customer-facing agents. |
+ | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
+ | `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
+ 
+diff --git a/plugins/memory/hindsight/__init__.py b/plugins/memory/hindsight/__init__.py
+index 736b255b13496777ca40f63c74609a6bd16e6749..86cb03b92e024a59eecee91bca68f3272e0df9ce 100644
+--- a/plugins/memory/hindsight/__init__.py
++++ b/plugins/memory/hindsight/__init__.py
+@@ -20,7 +20,7 @@ Config via environment variables:
+   HINDSIGHT_EMBED_PORT_HEALTH_GRACE_TIMEOUT — seconds to wait for a slow embedded daemon /health before treating it as stale (default: 30; set via config.json port_health_grace_timeout)
+   HINDSIGHT_RETAIN_TAGS            — comma-separated tags attached to retained memories
+   HINDSIGHT_RETAIN_OBSERVATION_SCOPES — observation scoping for retained memories: per_tag/combined/all_combinations, or a JSON list of tag-lists for custom scopes
+-  HINDSIGHT_RETAIN_SOURCE          — metadata source value attached to retained memories
++  HINDSIGHT_RETAIN_SOURCE          — metadata source value attached to retained memories (default: hermes)
+   HINDSIGHT_RETAIN_USER_PREFIX     — label used before user turns in retained transcripts
+   HINDSIGHT_RETAIN_ASSISTANT_PREFIX — label used before assistant turns in retained transcripts
+ 
+@@ -40,22 +40,42 @@ import queue
+ import sys
+ import threading
+ 
++from dataclasses import dataclass
+ from datetime import datetime, timezone
+-from typing import Any, Dict, List
++from typing import Any, Callable, Dict, List, Optional
+ 
+-from agent.memory_provider import MemoryProvider
++from agent.memory_provider import MemoryProvider, RecallStatus, INDICATOR_GLYPH
+ from hermes_constants import get_hermes_home
+ from tools.registry import tool_error
+ from hermes_cli.config import cfg_get
+ 
+ logger = logging.getLogger(__name__)
+ 
++
++@dataclass(frozen=True)
++class _RecallResult:
++    """Text + memory count from one recall.
++
++    Carrying the count alongside the text lets the deterministic recall
++    indicator report "recalled N memories" accurately without re-parsing the
++    formatted bullet list. ``count`` is 0 for a reflect synthesis (no discrete
++    memories) or on error.
++    """
++
++    text: str
++    count: int
++
+ _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
+ _DEFAULT_LOCAL_URL = "http://localhost:8888"
+ # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
+ _MIN_CLIENT_VERSION = "0.6.1"
+ _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
+ _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
++# ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
++# AGENTS.md forbids shipping third-party attribution tags on-by-default until a
++# generic user-facing opt-in exists, so this stays unset unless the user sets it
++# via the ``retain_source`` config key or HINDSIGHT_RETAIN_SOURCE (e.g. "hermes").
++_DEFAULT_RETAIN_SOURCE = ""
+ # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
+ # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
+ # Without it, reusing a stable session-scoped document_id silently
+@@ -149,6 +169,31 @@ def _check_local_runtime() -> tuple[bool, str | None]:
+         return False, str(exc)
+ 
+ 
++def _local_runtime_hint(reason: str | None) -> str:
++    """Actionable install guidance when the local_embedded runtime is missing.
++
++    ``local_embedded`` imports ``from hindsight import HindsightEmbedded``, which
++    is provided only by the ``hindsight-all`` package (its wheel ships the
++    top-level ``hindsight`` module). ``plugin.yaml`` declares only
++    ``hindsight-client`` (enough for cloud / local_external), so a user who
++    selected local_embedded without going through ``hermes memory setup`` — a
++    hand-written config, the legacy ``"mode": "local"`` alias, or a restored
++    backup — hits ``ModuleNotFoundError: No module named 'hindsight'``.
++    NousResearch/hermes-agent#7718.
++    """
++    text = (reason or "").lower()
++    if "no module named" in text and ("hindsight'" in text or 'hindsight"' in text
++                                      or "hindsight_embed" in text):
++        return (
++            f" Install the embedded runtime with: uv pip install --python "
++            f"{sys.executable} hindsight-all — or run 'hermes memory setup'. "
++            "(local_embedded needs the 'hindsight-all' package, which provides the "
++            "top-level 'hindsight' module; 'hindsight-client' alone only covers "
++            "cloud / local_external.)"
++        )
++    return ""
++
++
+ def _ensure_cloud_client_dependency() -> None:
+     """Install the Hindsight cloud client lazily before importing it."""
+     try:
+@@ -388,7 +433,7 @@ def _load_config() -> dict:
+         "idle_timeout": _parse_int_setting(os.environ.get("HINDSIGHT_IDLE_TIMEOUT"), _DEFAULT_IDLE_TIMEOUT),
+         "retain_tags": os.environ.get("HINDSIGHT_RETAIN_TAGS", ""),
+         "observation_scopes": os.environ.get("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", ""),
+-        "retain_source": os.environ.get("HINDSIGHT_RETAIN_SOURCE", ""),
++        "retain_source": os.environ.get("HINDSIGHT_RETAIN_SOURCE", _DEFAULT_RETAIN_SOURCE),
+         "retain_user_prefix": os.environ.get("HINDSIGHT_RETAIN_USER_PREFIX", "User"),
+         "retain_assistant_prefix": os.environ.get("HINDSIGHT_RETAIN_ASSISTANT_PREFIX", "Assistant"),
+         "banks": {
+@@ -653,7 +698,7 @@ class HindsightMemoryProvider(MemoryProvider):
+         self._memory_mode = "hybrid"  # "context", "tools", or "hybrid"
+         self._prefetch_method = "recall"  # "recall" or "reflect"
+         self._retain_tags: List[str] = []
+-        self._retain_source = ""
++        self._retain_source = _DEFAULT_RETAIN_SOURCE
+         self._retain_user_prefix = "User"
+         self._retain_assistant_prefix = "Assistant"
+         self._platform = ""
+@@ -670,8 +715,23 @@ class HindsightMemoryProvider(MemoryProvider):
+         self._timeout = _DEFAULT_TIMEOUT
+         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
+         self._prefetch_result = ""
++        # Number of memories in the pending prefetch block, captured alongside
++        # _prefetch_result so the deterministic recall indicator can report an
++        # accurate count without re-parsing the formatted text.
++        self._prefetch_count = 0
+         self._prefetch_lock = threading.Lock()
+         self._prefetch_thread = None
++        # State for the model-independent recall indicator (see recall_status()).
++        # _last_recall_returned tracks whether the most recent prefetch() handed
++        # any memory to the agent this turn; _last_recall_count is how many.
++        self._last_recall_returned = False
++        self._last_recall_count = 0
++        self._recall_indicator = True
++        # Deterministic retain indicator: emitted from sync_turn the moment a
++        # retain is dispatched to the writer (see _emit_saving_indicator). Uses
++        # the agent's status channel, injected via initialize(status_callback=).
++        self._retain_indicator = True
++        self._status_callback: Optional[Callable[[str], None]] = None
+         # Single-writer model for retain. sync_turn() enqueues; the writer
+         # thread drains sequentially. Avoids spawning ad-hoc threads that
+         # can race the interpreter shutdown and emit "cannot schedule new
+@@ -706,6 +766,7 @@ class HindsightMemoryProvider(MemoryProvider):
+ 
+         # Recall controls
+         self._auto_recall = True
++        self._recall_sync = False
+         self._recall_max_tokens = 4096
+         # Default to observation-only recall. Observations are Hindsight's
+         # consolidated knowledge layer — deduplicated, evidence-grounded
+@@ -747,6 +808,26 @@ class HindsightMemoryProvider(MemoryProvider):
+         except Exception:
+             return False
+ 
++    def unavailable_reason(self) -> str:
++        """Explain an unavailable local_embedded provider (missing runtime).
++
++        ``is_available()`` returns False for local modes when the embedded
++        runtime can't be imported, so ``initialize()`` — and the hint it would
++        log — is never reached (#7718). Surface the install guidance here, where
++        agent_init warns about an unavailable provider.
++        """
++        try:
++            cfg = _load_config()
++            mode = cfg.get("mode", "cloud")
++        except Exception:
++            return ""
++        if mode not in {"local", "local_embedded"}:
++            return ""
++        available, reason = _check_local_runtime()
++        if available:
++            return ""
++        return _local_runtime_hint(reason).strip()
++
+     def save_config(self, values, hermes_home):
+         """Write config to $HERMES_HOME/hindsight/config.json."""
+         import json
+@@ -952,6 +1033,12 @@ class HindsightMemoryProvider(MemoryProvider):
+                     new_lines.append(f"{k}={v}")
+             env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+ 
++        # Step 5: Optional starter template. Only for cloud / local_external —
++        # the API is reachable now; local_embedded's daemon isn't up during setup.
++        from . import templates as _hs_templates
++        if _hs_templates.supported_for_mode(mode):
++            self._offer_starter_template(mode, provider_config, env_writes)
++
+         if mode == "local_embedded":
+             materialized_config = dict(provider_config)
+             config_path = Path(hermes_home) / "hindsight" / "config.json"
+@@ -979,6 +1066,24 @@ class HindsightMemoryProvider(MemoryProvider):
+             print("  API keys saved to .env")
+         print("\n  Start a new session to activate.\n")
+ 
++    def _offer_starter_template(self, mode: str, provider_config: dict, env_writes: dict) -> None:
++        """Offer to seed the bank with a Hermes starter template (best-effort)."""
++        from hermes_cli.memory_setup import _CANCELLED, _curses_select
++
++        from . import templates as _hs_templates
++
++        default_url = _DEFAULT_LOCAL_URL if mode == "local_external" else _DEFAULT_API_URL
++        api_url = provider_config.get("api_url") or default_url
++        bank_id = provider_config.get("bank_id", "hermes")
++        api_key = env_writes.get("HINDSIGHT_API_KEY") or os.environ.get("HINDSIGHT_API_KEY", "") or None
++        _hs_templates.run_template_step(
++            api_url=api_url,
++            bank_id=bank_id,
++            api_key=api_key,
++            select=_curses_select,
++            cancelled=_CANCELLED,
++        )
++
+     def get_config_schema(self):
+         return [
+             {"key": "mode", "description": "Connection mode", "default": "cloud", "choices": ["cloud", "local_embedded", "local_external"]},
+@@ -1002,13 +1107,16 @@ class HindsightMemoryProvider(MemoryProvider):
+             {"key": "recall_prefetch_method", "description": "Auto-recall method", "default": "recall", "choices": ["recall", "reflect"]},
+             {"key": "retain_tags", "description": "Default tags applied to retained memories (comma-separated)", "default": ""},
+             {"key": "observation_scopes", "description": "How observations are scoped during consolidation: 'combined' (default — one pass over all tags), 'per_tag' (one isolated observation per tag), 'all_combinations' (every tag subset — expensive), or a JSON list of tag-lists for explicit custom scopes. Empty uses Hindsight's 'combined' default.", "default": ""},
+-            {"key": "retain_source", "description": "Metadata source value attached to retained memories", "default": ""},
++            {"key": "retain_source", "description": "Metadata source value attached to retained memories (identifies the client that stored them)", "default": _DEFAULT_RETAIN_SOURCE},
+             {"key": "retain_user_prefix", "description": "Label used before user turns in retained transcripts", "default": "User"},
+             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
+             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
+             {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
+             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
+             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
++            {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
++            {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
++            {"key": "retain_indicator", "description": "Show a '👁️ Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
+             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
+             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
+             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
+@@ -1214,6 +1322,11 @@ class HindsightMemoryProvider(MemoryProvider):
+     def initialize(self, session_id: str, **kwargs) -> None:
+         self._session_id = str(session_id or "").strip()
+         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
++        # Agent status channel for the deterministic retain indicator (recall
++        # emits via the pull-based recall_status()/describe_recall() path).
++        _status_cb = kwargs.get("status_callback")
++        if callable(_status_cb):
++            self._status_callback = _status_cb
+ 
+         # Each process lifecycle gets its own document_id. Reusing session_id
+         # alone caused overwrites on /resume — the reloaded session starts
+@@ -1279,8 +1392,9 @@ class HindsightMemoryProvider(MemoryProvider):
+             available, reason = _check_local_runtime()
+             if not available:
+                 logger.warning(
+-                    "Hindsight local mode disabled because its runtime could not be imported: %s",
++                    "Hindsight local mode disabled because its runtime could not be imported: %s.%s",
+                     reason,
++                    _local_runtime_hint(reason),
+                 )
+                 self._mode = "disabled"
+                 return
+@@ -1327,7 +1441,7 @@ class HindsightMemoryProvider(MemoryProvider):
+         self._recall_tags = self._config.get("recall_tags") or None
+         self._recall_tags_match = self._config.get("recall_tags_match", "any")
+         self._retain_source = str(
+-            self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", "")
++            self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", _DEFAULT_RETAIN_SOURCE)
+         ).strip()
+         self._retain_user_prefix = str(
+             self._config.get("retain_user_prefix") or os.environ.get("HINDSIGHT_RETAIN_USER_PREFIX", "User")
+@@ -1343,6 +1457,7 @@ class HindsightMemoryProvider(MemoryProvider):
+ 
+         # Recall controls
+         self._auto_recall = self._config.get("auto_recall", True)
++        self._recall_sync = bool(self._config.get("recall_sync", False))
+         self._recall_max_tokens = int(self._config.get("recall_max_tokens", 4096))
+         # Default narrows recall to observation-only; pass an explicit
+         # `recall_types` list in config.json to broaden (e.g. include
+@@ -1356,6 +1471,14 @@ class HindsightMemoryProvider(MemoryProvider):
+         else:
+             self._recall_types = list(configured_types) or ["observation"]
+         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
++        # On-by-default deterministic indicator: when auto-recall injects memory,
++        # Hermes emits a "👁️ Hindsight — recalled N memories" status line so the
++        # user SEES memory working, independent of whether the model mentions it.
++        # Off switch for customer-facing agents that shouldn't surface internals.
++        self._recall_indicator = bool(self._config.get("recall_indicator", True))
++        # Companion retain indicator: "👁️ Hindsight — saving to memory…" emitted
++        # when a turn is dispatched to the writer. Same off switch rationale.
++        self._retain_indicator = bool(self._config.get("retain_indicator", True))
+         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
+         self._retain_async = self._config.get("retain_async", True)
+ 
+@@ -1469,13 +1592,58 @@ class HindsightMemoryProvider(MemoryProvider):
+             f"hindsight_retain to store facts."
+         )
+ 
+-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+-        if self._prefetch_thread and self._prefetch_thread.is_alive():
+-            logger.debug("Prefetch: waiting for background thread to complete")
+-            self._prefetch_thread.join(timeout=3.0)
+-        with self._prefetch_lock:
+-            result = self._prefetch_result
+-            self._prefetch_result = ""
++    def _recall_disabled(self) -> bool:
++        """Guards shared by the async and synchronous recall paths."""
++        if self._memory_mode == "tools":
++            logger.debug("Prefetch: skipped (tools-only mode)")
++            return True
++        if not self._auto_recall:
++            logger.debug("Prefetch: skipped (auto_recall disabled)")
++            return True
++        if self._shutting_down.is_set():
++            logger.debug("Prefetch: skipped (shutting down)")
++            return True
++        return False
++
++    def _do_recall(self, query: str) -> _RecallResult:
++        """Run one recall/reflect for *query*.
++
++        Returns the formatted memory text plus the number of discrete memories
++        recalled (0 for a reflect synthesis or on error), so the deterministic
++        recall indicator can report an accurate count without re-parsing the
++        text. Shared by the background prefetch worker (``queue_prefetch``) and
++        the opt-in synchronous path (``prefetch`` when ``recall_sync`` is on).
++        """
++        # Truncate query to max chars
++        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
++            query = query[:self._recall_max_input_chars]
++        try:
++            if self._prefetch_method == "reflect":
++                logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
++                resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
++                # Reflect synthesizes across many memories -> no discrete count.
++                return _RecallResult(resp.text or "", 0)
++            recall_kwargs: dict = {
++                "bank_id": self._bank_id, "query": query,
++                "budget": self._budget, "max_tokens": self._recall_max_tokens,
++            }
++            if self._recall_tags:
++                recall_kwargs["tags"] = self._recall_tags
++                recall_kwargs["tags_match"] = self._recall_tags_match
++            if self._recall_types:
++                recall_kwargs["types"] = self._recall_types
++            logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
++                         self._bank_id, len(query), self._budget)
++            resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
++            num_results = len(resp.results) if resp.results else 0
++            logger.debug("Recall: returned %d results", num_results)
++            text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
++            return _RecallResult(text, num_results)
++        except Exception as e:
++            logger.debug("Hindsight recall failed: %s", e, exc_info=True)
++            return _RecallResult("", 0)
++
++    def _format_recall(self, result: str) -> str:
+         if not result:
+             logger.debug("Prefetch: no results available")
+             return ""
+@@ -1487,47 +1655,65 @@ class HindsightMemoryProvider(MemoryProvider):
+         )
+         return f"{header}\n\n{result}"
+ 
++    def _record_recall_indicator(self, *, returned: bool, count: int) -> None:
++        """Track what the last prefetch injected, for recall_status().
++
++        Cleared to "nothing" on empty turns so the indicator never reports a
++        stale prior count.
++        """
++        self._last_recall_returned = returned
++        self._last_recall_count = count if returned else 0
++
++    def prefetch(self, query: str, *, session_id: str = "") -> str:
++        # Opt-in: recall synchronously against the *current* message so the
++        # injected memories match this turn's query rather than the previous
++        # turn's queued recall. See NousResearch/hermes-agent#5820.
++        if self._recall_sync:
++            if self._recall_disabled():
++                self._record_recall_indicator(returned=False, count=0)
++                return ""
++            recalled = self._do_recall(query)
++            self._record_recall_indicator(returned=bool(recalled.text), count=recalled.count)
++            return self._format_recall(recalled.text)
++
++        # Default: return the result the background worker prefetched for the
++        # previous turn (cheap buffer read, capped join).
++        if self._prefetch_thread and self._prefetch_thread.is_alive():
++            logger.debug("Prefetch: waiting for background thread to complete")
++            self._prefetch_thread.join(timeout=3.0)
++        with self._prefetch_lock:
++            result = self._prefetch_result
++            count = self._prefetch_count
++            self._prefetch_result = ""
++            self._prefetch_count = 0
++        self._record_recall_indicator(returned=bool(result), count=count)
++        return self._format_recall(result)
++
++    def recall_status(self) -> Optional[RecallStatus]:
++        """Report the count injected by the last prefetch (for the UI indicator).
++
++        Returns ``None`` when nothing was injected this turn or the indicator
++        is turned off (``recall_indicator=false``), so customer-facing agents
++        can suppress the "recalled N memories" status line.
++        """
++        if not self._recall_indicator or not self._last_recall_returned:
++            return None
++        return RecallStatus(provider_label="Hindsight", count=self._last_recall_count)
++
+     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+-        if self._memory_mode == "tools":
+-            logger.debug("Prefetch: skipped (tools-only mode)")
+-            return
+-        if not self._auto_recall:
+-            logger.debug("Prefetch: skipped (auto_recall disabled)")
++        # In synchronous mode prefetch() does a live recall each turn, so
++        # there's nothing to prime in the background.
++        if self._recall_sync:
+             return
+-        if self._shutting_down.is_set():
+-            logger.debug("Prefetch: skipped (shutting down)")
++        if self._recall_disabled():
+             return
+-        # Truncate query to max chars
+-        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
+-            query = query[:self._recall_max_input_chars]
+ 
+         def _run():
+-            try:
+-                if self._prefetch_method == "reflect":
+-                    logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
+-                    resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+-                    text = resp.text or ""
+-                else:
+-                    recall_kwargs: dict = {
+-                        "bank_id": self._bank_id, "query": query,
+-                        "budget": self._budget, "max_tokens": self._recall_max_tokens,
+-                    }
+-                    if self._recall_tags:
+-                        recall_kwargs["tags"] = self._recall_tags
+-                        recall_kwargs["tags_match"] = self._recall_tags_match
+-                    if self._recall_types:
+-                        recall_kwargs["types"] = self._recall_types
+-                    logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
+-                                 self._bank_id, len(query), self._budget)
+-                    resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+-                    num_results = len(resp.results) if resp.results else 0
+-                    logger.debug("Prefetch: recall returned %d results", num_results)
+-                    text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+-                if text:
+-                    with self._prefetch_lock:
+-                        self._prefetch_result = text
+-            except Exception as e:
+-                logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
++            recalled = self._do_recall(query)
++            if recalled.text:
++                with self._prefetch_lock:
++                    self._prefetch_result = recalled.text
++                    self._prefetch_count = recalled.count
+ 
+         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
+         self._prefetch_thread.start()
+@@ -1695,12 +1881,31 @@ class HindsightMemoryProvider(MemoryProvider):
+ 
+         self._ensure_writer()
+         self._register_atexit()
++        # Deterministic "saving to memory" indicator — emitted the moment a
++        # real retain is dispatched (past every skip/buffer gate above), so it
++        # only fires on turns that actually persist.
++        self._emit_saving_indicator()
+         self._retain_queue.put(_do_retain)
+         # Advance the append watermark only after the delta is queued, so a
+         # later retain doesn't re-ship turns we've already handed to the writer.
+         if update_mode == "append":
+             self._last_retained_turn_count = len(self._session_turns)
+ 
++    def _emit_saving_indicator(self) -> None:
++        """Surface a model-independent "saving to memory" status line.
++
++        Runs on the background sync worker (sync_turn's caller). No-ops when the
++        indicator is turned off (``retain_indicator=false``) or no status
++        channel was injected. Never raises — a status-line failure must not
++        derail the retain.
++        """
++        if not self._retain_indicator or self._status_callback is None:
++            return
++        try:
++            self._status_callback(f"{INDICATOR_GLYPH} Hindsight — saving to memory…")
++        except Exception:
++            logger.debug("Retain indicator emit failed (non-fatal)", exc_info=True)
++
+     def get_tool_schemas(self) -> List[Dict[str, Any]]:
+         if self._memory_mode == "context":
+             return []
+diff --git a/plugins/memory/hindsight/templates.py b/plugins/memory/hindsight/templates.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5df722802591d795d16d3e7ace8ccbd26cf87f8e
+--- /dev/null
++++ b/plugins/memory/hindsight/templates.py
+@@ -0,0 +1,151 @@
++"""Starter bank templates for the Hindsight memory-provider setup wizard.
++
++Fetches the Hindsight Bank Templates catalog, filters to templates tagged for
++the ``hermes`` integration, and applies a chosen manifest to the user's bank
++via the import API (``POST /v1/default/banks/{bank}/import``, which creates the
++bank if it doesn't exist).
++
++Kept out of ``__init__`` so the wizard logic stays small and testable. The
++catalog source is overridable with ``HINDSIGHT_TEMPLATES_URL`` (e.g. to pin a
++version or point at a mirror).
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import urllib.request
++from urllib.parse import urljoin
++
++logger = logging.getLogger(__name__)
++
++# The Bank Templates catalog lives in the Hindsight docs repo and is the same
++# file that powers hindsight.vectorize.io/templates.
++_DEFAULT_CATALOG_URL = (
++    "https://raw.githubusercontent.com/vectorize-io/hindsight/main/"
++    "hindsight-docs/src/data/templates.json"
++)
++_HTTP_TIMEOUT = 15
++
++# The starter-template step needs the API reachable during setup. A
++# local_embedded daemon isn't running yet at that point, so it's skipped there.
++SUPPORTED_MODES = ("cloud", "local_external")
++
++
++def supported_for_mode(mode: str) -> bool:
++    return mode in SUPPORTED_MODES
++
++
++def catalog_url() -> str:
++    return os.environ.get("HINDSIGHT_TEMPLATES_URL", _DEFAULT_CATALOG_URL)
++
++
++def _get_json(url: str) -> dict:
++    req = urllib.request.Request(url, headers={"Accept": "application/json"})
++    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:  # noqa: S310 - fixed https catalog
++        return json.loads(resp.read().decode("utf-8"))
++
++
++def fetch_hermes_templates(url: str | None = None) -> list[dict]:
++    """Return catalog entries tagged for the ``hermes`` integration."""
++    catalog = _get_json(url or catalog_url())
++    entries = catalog.get("templates", []) if isinstance(catalog, dict) else []
++    return [e for e in entries if "hermes" in (e.get("integrations") or [])]
++
++
++def fetch_manifest(entry: dict, url: str | None = None) -> dict:
++    """Fetch the BankTemplateManifest JSON for a catalog entry."""
++    # manifest_file is relative to the catalog (e.g. "templates/foo.json").
++    manifest_url = urljoin(url or catalog_url(), entry["manifest_file"])
++    return _get_json(manifest_url)
++
++
++def apply_template(api_url: str, bank_id: str, api_key: str | None, manifest: dict) -> None:
++    """Apply a manifest to a bank via the import endpoint. Raises on failure."""
++    endpoint = f"{api_url.rstrip('/')}/v1/default/banks/{bank_id}/import"
++    data = json.dumps(manifest).encode("utf-8")
++    headers = {"Content-Type": "application/json"}
++    if api_key:
++        headers["Authorization"] = f"Bearer {api_key}"
++    req = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")  # noqa: S310
++    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:  # noqa: S310
++        resp.read()  # drain; urlopen raises HTTPError on non-2xx
++
++
++def probe_existing_customization(api_url: str, bank_id: str, api_key: str | None) -> bool:
++    """Best-effort: True if the bank already has template-level config, mental
++    models, or directives — i.e. applying a template would overwrite settings.
++
++    A missing bank, or any error, is treated as "not customized": the step must
++    never block on this probe.
++    """
++    endpoint = f"{api_url.rstrip('/')}/v1/default/banks/{bank_id}/export"
++    headers = {"Accept": "application/json"}
++    if api_key:
++        headers["Authorization"] = f"Bearer {api_key}"
++    req = urllib.request.Request(endpoint, headers=headers)  # noqa: S310
++    try:
++        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:  # noqa: S310
++            data = json.loads(resp.read().decode("utf-8"))
++    except Exception as e:  # missing bank / network — treat as not customized
++        logger.debug("Hindsight: bank customization probe skipped: %s", e)
++        return False
++    return bool(data.get("bank") or data.get("mental_models") or data.get("directives"))
++
++
++def run_template_step(
++    *,
++    api_url: str,
++    bank_id: str,
++    api_key: str | None,
++    select,
++    cancelled,
++    log=print,
++) -> str | None:
++    """Drive the wizard's starter-template step.
++
++    ``select(title, items, default, cancel_returns)`` is the picker (injected so
++    this is testable without curses). Returns the applied template id, or None
++    if skipped/blank/failed. Never raises — the template is a nice-to-have.
++    """
++    try:
++        entries = fetch_hermes_templates()
++    except Exception as e:  # network/parse — non-fatal
++        logger.debug("Hindsight: could not fetch templates: %s", e)
++        return None
++    if not entries:
++        return None
++
++    items = [(e.get("name", e["id"]), (e.get("description") or "")[:72]) for e in entries]
++    items.append(("Blank", "Start with an empty memory bank"))
++    idx = select("  Starter memory template", items, default=0, cancel_returns=cancelled)
++    if idx == cancelled or idx >= len(entries):
++        return None  # blank or cancelled
++
++    entry = entries[idx]
++
++    # If the bank is already configured (re-running setup on an existing bank),
++    # applying a template overwrites its config and upserts its models/directives.
++    # Confirm before clobbering.
++    if probe_existing_customization(api_url, bank_id, api_key):
++        confirm = select(
++            f"  Bank '{bank_id}' already has memory settings — apply this template on top?",
++            [("Apply", "Overwrite config; add/update mental models & directives"),
++             ("Keep existing", "Leave the bank as-is")],
++            default=1,
++            cancel_returns=cancelled,
++        )
++        if confirm != 0:
++            log(f"  Kept existing settings for bank '{bank_id}'.")
++            return None
++
++    try:
++        manifest = fetch_manifest(entry)
++        apply_template(api_url, bank_id, api_key, manifest)
++        log(f"  ✓ Applied '{entry.get('name', entry['id'])}' template to bank '{bank_id}'")
++        return entry["id"]
++    except Exception as e:
++        log(f"  ⚠ Could not apply template ({e}). You can apply one later from "
++            f"hindsight.vectorize.io/templates.")
++        return None
+diff --git a/tests/agent/test_memory_provider_unavailable_warning.py b/tests/agent/test_memory_provider_unavailable_warning.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d161a0a3b1d3a294bc78a60a311651bd47eddc29
+--- /dev/null
++++ b/tests/agent/test_memory_provider_unavailable_warning.py
+@@ -0,0 +1,59 @@
++"""Regression tests for NousResearch/hermes-agent#2765.
++
++A memory provider configured via ``memory.provider`` but reporting
++``is_available() == False`` (e.g. missing credentials, or a systemd/gateway
++service that didn't inherit ``~/.hermes/.env``) used to be dropped silently.
++``agent_init`` now emits a one-time, deduped warning instead.
++"""
++
++import logging
++
++from agent import agent_init
++
++
++def test_warns_once_and_dedupes(caplog):
++    agent_init._warned_unavailable_providers.clear()
++    with caplog.at_level(logging.WARNING, logger="run_agent"):
++        agent_init._warn_memory_provider_unavailable("hindsight")
++        agent_init._warn_memory_provider_unavailable("hindsight")
++
++    warnings = [r for r in caplog.records if "unavailable" in r.getMessage()]
++    assert len(warnings) == 1, "should warn exactly once per provider (gateway dedup)"
++    msg = warnings[0].getMessage()
++    assert "hindsight" in msg
++    assert "hermes memory status" in msg
++    assert ".env" in msg  # surfaces the systemd/gateway root cause
++
++
++def test_distinct_providers_each_warn(caplog):
++    agent_init._warned_unavailable_providers.clear()
++    with caplog.at_level(logging.WARNING, logger="run_agent"):
++        agent_init._warn_memory_provider_unavailable("hindsight")
++        agent_init._warn_memory_provider_unavailable("mem0")
++
++    warnings = [r for r in caplog.records if "unavailable" in r.getMessage()]
++    assert len(warnings) == 2
++
++
++def test_provider_reason_is_appended(caplog):
++    # A provider's unavailable_reason() (e.g. the local_embedded install hint,
++    # #7718) reaches the user through this warning — the only path that runs
++    # when the provider is unavailable and thus never initialized.
++    agent_init._warned_unavailable_providers.clear()
++    hint = "Install the embedded runtime with: uv pip install hindsight-all."
++    with caplog.at_level(logging.WARNING, logger="run_agent"):
++        agent_init._warn_memory_provider_unavailable("hindsight", hint)
++
++    warnings = [r for r in caplog.records if "unavailable" in r.getMessage()]
++    assert len(warnings) == 1
++    assert hint in warnings[0].getMessage()
++
++
++def test_empty_reason_adds_no_trailing_noise(caplog):
++    agent_init._warned_unavailable_providers.clear()
++    with caplog.at_level(logging.WARNING, logger="run_agent"):
++        agent_init._warn_memory_provider_unavailable("hindsight", "")
++
++    msg = next(r.getMessage() for r in caplog.records if "unavailable" in r.getMessage())
++    # No dangling separator when there's no provider-specific hint.
++    assert msg.rstrip().endswith("service environment.")
+diff --git a/tests/agent/test_memory_recall_indicator.py b/tests/agent/test_memory_recall_indicator.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4f43d307759ba74473a0ec0480e62c09bba241d
+--- /dev/null
++++ b/tests/agent/test_memory_recall_indicator.py
+@@ -0,0 +1,90 @@
++"""MemoryManager.describe_recall — the deterministic recall indicator.
++
++When auto-recall injects memory, Hermes surfaces a model-independent
++"👁️ <provider> — recalled N memories" status line so the user SEES memory
++working regardless of whether the model chooses to mention it. These tests
++lock the formatting (singular/plural/generic) and the aggregation across
++providers, all deterministically (no LLM, no network).
++"""
++from typing import Optional
++
++from agent.memory_manager import MemoryManager
++from agent.memory_provider import MemoryProvider, RecallStatus
++
++
++class _FakeProvider(MemoryProvider):
++    """Provider with a settable recall_status for indicator tests."""
++
++    def __init__(self, name: str, status: Optional[RecallStatus], *, raises: bool = False):
++        self._name = name
++        self._status = status
++        self._raises = raises
++
++    @property
++    def name(self) -> str:
++        return self._name
++
++    def is_available(self) -> bool:
++        return True
++
++    def initialize(self, session_id: str = "", **kwargs) -> None:
++        pass
++
++    def get_tool_schemas(self):
++        return []
++
++    def handle_tool_call(self, tool_name, args, **kwargs) -> str:
++        return ""
++
++    def recall_status(self) -> Optional[RecallStatus]:
++        if self._raises:
++            raise RuntimeError("boom")
++        return self._status
++
++
++def test_no_status_returns_empty_string():
++    mgr = MemoryManager()
++    mgr.add_provider(_FakeProvider("hindsight", None))
++    assert mgr.describe_recall() == ""
++
++
++def test_no_providers_returns_empty_string():
++    assert MemoryManager().describe_recall() == ""
++
++
++def test_single_memory_is_singular():
++    mgr = MemoryManager()
++    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 1)))
++    assert mgr.describe_recall() == "👁️ Hindsight — recalled 1 memory"
++
++
++def test_multiple_memories_are_plural():
++    mgr = MemoryManager()
++    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 3)))
++    assert mgr.describe_recall() == "👁️ Hindsight — recalled 3 memories"
++
++
++def test_zero_count_renders_generic():
++    # count 0 = content injected but no discrete count (e.g. reflect synthesis).
++    mgr = MemoryManager()
++    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 0)))
++    assert mgr.describe_recall() == "👁️ Hindsight — recalled relevant memory"
++
++
++def test_aggregates_multiple_providers():
++    # builtin is always accepted first; a second external is rejected, so use
++    # builtin + one external to exercise the join path.
++    mgr = MemoryManager()
++    mgr.add_provider(_FakeProvider("builtin", RecallStatus("Notes", 2)))
++    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 5)))
++    result = mgr.describe_recall()
++    assert "👁️ Notes — recalled 2 memories" in result
++    assert "👁️ Hindsight — recalled 5 memories" in result
++
++
++def test_failing_provider_is_skipped_not_fatal():
++    mgr = MemoryManager()
++    mgr.add_provider(_FakeProvider("builtin", None, raises=True))
++    mgr.add_provider(_FakeProvider("hindsight", RecallStatus("Hindsight", 1)))
++    # The raising provider is swallowed; the healthy one still surfaces.
++    assert mgr.describe_recall() == "👁️ Hindsight — recalled 1 memory"
+diff --git a/tests/agent/test_turn_context.py b/tests/agent/test_turn_context.py
+index 9a0afb4f2cb562f62d192e61f3f1537ae06d6597..c9b4e7942d43d6edc8acb18bc4cafb7105ada890 100644
+--- a/tests/agent/test_turn_context.py
++++ b/tests/agent/test_turn_context.py
+@@ -286,6 +286,35 @@ def test_pending_cli_message_uses_clean_override_for_api_local_note():
+ 
+ 
+ 
++def test_recall_indicator_emitted_when_memory_injected():
++    """When prefetch injects memory, the deterministic indicator is emitted."""
++    agent = _FakeAgent()
++    agent._emit_status = MagicMock()
++    mm = MagicMock()
++    mm.prefetch_all.return_value = "- recalled fact"
++    mm.describe_recall.return_value = "👁️ Hindsight — recalled 2 memories"
++    agent._memory_manager = mm
++
++    _build(agent)
++
++    agent._emit_status.assert_any_call("👁️ Hindsight — recalled 2 memories")
++
++
++def test_recall_indicator_skipped_when_nothing_injected():
++    """No memory injected → describe_recall isn't consulted, nothing emitted."""
++    agent = _FakeAgent()
++    agent._emit_status = MagicMock()
++    mm = MagicMock()
++    mm.prefetch_all.return_value = ""
++    agent._memory_manager = mm
++
++    _build(agent)
++
++    mm.describe_recall.assert_not_called()
++    for call in agent._emit_status.call_args_list:
++        assert "👁️" not in str(call)
++
++
+ def test_ensure_db_session_runs_after_system_prompt_restore():
+     """Regression for #45499.
+ 
+diff --git a/tests/hermes_cli/test_memory_status_env_hint.py b/tests/hermes_cli/test_memory_status_env_hint.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c33da182917b854f80a3221e9f79345a2ba63494
+--- /dev/null
++++ b/tests/hermes_cli/test_memory_status_env_hint.py
+@@ -0,0 +1,43 @@
++"""`hermes memory status` should explain *why* a provider is unavailable.
++
++Regression coverage for NousResearch/hermes-agent#2765: when the selected
++provider reports unavailable, status lists the missing env vars and surfaces
++the systemd/gateway ``.env``-inheritance gotcha that most often causes it.
++"""
++
++import hermes_cli.memory_setup as memory_setup
++
++
++class _UnavailableProvider:
++    def is_available(self):
++        return False
++
++    def get_config_schema(self):
++        return [
++            {
++                "key": "api_key",
++                "env_var": "HINDSIGHT_API_KEY",
++                "secret": True,
++                "url": "https://ui.hindsight.vectorize.io",
++            }
++        ]
++
++
++def test_status_surfaces_env_inheritance_hint_when_unavailable(monkeypatch, capsys):
++    monkeypatch.delenv("HINDSIGHT_API_KEY", raising=False)
++    monkeypatch.setattr(
++        memory_setup,
++        "_get_available_providers",
++        lambda: [("hindsight", "cloud", _UnavailableProvider())],
++    )
++    monkeypatch.setattr(
++        "hermes_cli.config.load_config",
++        lambda: {"memory": {"provider": "hindsight", "hindsight": {}}},
++    )
++
++    memory_setup.cmd_status(object())
++    out = capsys.readouterr().out
++
++    assert "not available" in out
++    assert "HINDSIGHT_API_KEY" in out  # names the missing var
++    assert ".env" in out               # systemd/gateway root-cause hint
+diff --git a/tests/plugins/memory/test_hindsight_local_runtime_hint.py b/tests/plugins/memory/test_hindsight_local_runtime_hint.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..075cb38e3a418cc581f224237102b696c0990a0a
+--- /dev/null
++++ b/tests/plugins/memory/test_hindsight_local_runtime_hint.py
+@@ -0,0 +1,56 @@
++"""NousResearch/hermes-agent#7718 — actionable message when local_embedded
++runtime (`hindsight-all`) is missing.
++
++`local_embedded` imports `from hindsight import HindsightEmbedded`, provided
++only by `hindsight-all`. When it's absent the provider disables itself; the
++disable warning should point the user at the fix rather than just echoing
++`No module named 'hindsight'`.
++"""
++
++import sys
++
++import plugins.memory.hindsight as hs
++from plugins.memory.hindsight import HindsightMemoryProvider, _local_runtime_hint
++
++
++def test_hint_for_missing_hindsight_all():
++    hint = _local_runtime_hint("No module named 'hindsight'")
++    assert "hindsight-all" in hint
++    assert "hermes memory setup" in hint
++    assert sys.executable in hint
++
++
++def test_hint_for_missing_hindsight_embed():
++    hint = _local_runtime_hint("No module named 'hindsight_embed.daemon_embed_manager'")
++    assert "hindsight-all" in hint
++
++
++def test_no_hint_for_unrelated_runtime_error():
++    # e.g. the NumPy-on-old-CPU failure _check_local_runtime also guards against
++    assert _local_runtime_hint("Illegal instruction (NumPy SIMD)") == ""
++    assert _local_runtime_hint(None) == ""
++
++
++# unavailable_reason() — surfaces the hint through the reachable path (#7718):
++# is_available() gates initialize() out, so the hint must come from here.
++
++
++def test_unavailable_reason_surfaces_hint_for_local_embedded(monkeypatch):
++    monkeypatch.setattr(hs, "_load_config", lambda: {"mode": "local_embedded"})
++    monkeypatch.setattr(hs, "_check_local_runtime", lambda: (False, "No module named 'hindsight'"))
++    reason = HindsightMemoryProvider().unavailable_reason()
++    assert "hindsight-all" in reason
++    assert reason == reason.strip()  # no leading/trailing whitespace
++
++
++def test_unavailable_reason_empty_for_cloud(monkeypatch):
++    monkeypatch.setattr(hs, "_load_config", lambda: {"mode": "cloud"})
++    # Should not even probe the runtime for a cloud provider.
++    monkeypatch.setattr(hs, "_check_local_runtime", lambda: (_ for _ in ()).throw(AssertionError("probed")))
++    assert HindsightMemoryProvider().unavailable_reason() == ""
++
++
++def test_unavailable_reason_empty_when_runtime_present(monkeypatch):
++    monkeypatch.setattr(hs, "_load_config", lambda: {"mode": "local_embedded"})
++    monkeypatch.setattr(hs, "_check_local_runtime", lambda: (True, None))
++    assert HindsightMemoryProvider().unavailable_reason() == ""
+diff --git a/tests/plugins/memory/test_hindsight_provider.py b/tests/plugins/memory/test_hindsight_provider.py
+index 0c72bd6203df5e3b8f2c28a6c2a113323dca9a51..ba60fa1802e26996a8f664877d50c989f5edf9e6 100644
+--- a/tests/plugins/memory/test_hindsight_provider.py
++++ b/tests/plugins/memory/test_hindsight_provider.py
+@@ -317,6 +317,20 @@ class TestConfig:
+         assert p._recall_max_input_chars == 500
+         assert p._bank_mission == "Test agent mission"
+ 
++    def test_retain_source_defaults_empty(self, provider):
++        # Opt-in per AGENTS.md: no attribution tag ships by default.
++        assert provider._retain_source == ""
++
++    def test_retain_source_absent_from_metadata_by_default(self, provider):
++        # metadata.source is stamped only when the user sets retain_source.
++        meta = provider._build_metadata(message_count=2, turn_index=1)
++        assert "source" not in meta
++
++    def test_retain_source_user_override_wins(self, provider_with_config):
++        # Users can still opt in explicitly (config key / env var).
++        p = provider_with_config(retain_source="cogoport")
++        assert p._retain_source == "cogoport"
++        assert p._build_metadata(message_count=2, turn_index=1)["source"] == "cogoport"
+ 
+     def test_embedded_profile_env_includes_idle_timeout_from_config(self):
+         env = _build_embedded_profile_env({
+@@ -495,6 +509,43 @@ class TestPrefetch:
+         assert provider.prefetch("test") == ""
+ 
+ 
++    def test_recall_sync_defaults_off(self, provider):
++        assert provider._recall_sync is False
++
++    def test_recall_sync_recalls_current_query_synchronously(self, provider_with_config):
++        # recall_sync=True: prefetch() must do a live recall against the
++        # *current* query (not read a previously queued buffer). #5820
++        p = provider_with_config(recall_sync=True)
++        captured = {}
++
++        def _capture_recall(**kwargs):
++            captured["query"] = kwargs.get("query", "")
++            return SimpleNamespace(results=[SimpleNamespace(text="fresh memory")])
++
++        p._client.arecall = AsyncMock(side_effect=_capture_recall)
++
++        # Nothing pre-buffered — proves the result comes from a live recall.
++        assert p._prefetch_result == ""
++        result = p.prefetch("fix tests")
++
++        assert captured["query"] == "fix tests"       # current query, not ignored
++        assert "fresh memory" in result
++        p._client.arecall.assert_called_once()
++
++    def test_recall_sync_skips_background_queue(self, provider_with_config):
++        # With sync recall there's nothing to prime in the background.
++        p = provider_with_config(recall_sync=True)
++        p.queue_prefetch("anything")
++        assert p._prefetch_thread is None
++
++    def test_async_default_ignores_current_query_and_reads_buffer(self, provider):
++        # Default (recall_sync off): prefetch returns the buffered result and
++        # does NOT issue a live recall for the current query.
++        provider._prefetch_result = "- buffered from previous turn"
++        result = provider.prefetch("a totally different current query")
++        assert "buffered from previous turn" in result
++        provider._client.arecall.assert_not_called()
++
+     def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):
+         p = provider_with_config(memory_mode="tools")
+         p.queue_prefetch("test")
+@@ -502,6 +553,87 @@ class TestPrefetch:
+         assert p._prefetch_thread is None
+ 
+ 
++# ---------------------------------------------------------------------------
++# recall_status (deterministic recall indicator) tests
++# ---------------------------------------------------------------------------
++
++
++class TestRecallStatus:
++    def test_none_before_any_prefetch(self, provider):
++        # Nothing recalled yet → no indicator.
++        assert provider.recall_status() is None
++
++    def test_reports_count_after_recall(self, provider):
++        # Mock client returns 2 memories; prefetch consumes the block.
++        provider.queue_prefetch("test")
++        if provider._prefetch_thread:
++            provider._prefetch_thread.join(timeout=5.0)
++        provider.prefetch("test")
++
++        status = provider.recall_status()
++        assert status is not None
++        assert status.provider_label == "Hindsight"
++        assert status.count == 2
++
++    def test_reports_count_in_recall_sync_mode(self, provider_with_config):
++        # recall_sync path does a live recall inside prefetch() (no background
++        # prime) — the indicator must still report the count for that turn.
++        p = provider_with_config(recall_sync=True)
++        assert p.prefetch("test")  # live recall returns the 2 mock memories
++        status = p.recall_status()
++        assert status is not None
++        assert status.count == 2
++
++    def test_none_when_recall_returned_nothing(self, provider):
++        provider._client.arecall = AsyncMock(
++            return_value=SimpleNamespace(results=[])
++        )
++        provider.queue_prefetch("test")
++        if provider._prefetch_thread:
++            provider._prefetch_thread.join(timeout=5.0)
++        assert provider.prefetch("test") == ""
++        assert provider.recall_status() is None
++
++    def test_stale_count_cleared_on_empty_turn(self, provider):
++        # First turn recalls 2 memories.
++        provider.queue_prefetch("test")
++        if provider._prefetch_thread:
++            provider._prefetch_thread.join(timeout=5.0)
++        provider.prefetch("test")
++        assert provider.recall_status().count == 2
++
++        # Next turn recalls nothing — the prior count must not linger.
++        provider._client.arecall = AsyncMock(
++            return_value=SimpleNamespace(results=[])
++        )
++        provider.queue_prefetch("test2")
++        if provider._prefetch_thread:
++            provider._prefetch_thread.join(timeout=5.0)
++        provider.prefetch("test2")
++        assert provider.recall_status() is None
++
++    def test_suppressed_when_indicator_off(self, provider_with_config):
++        p = provider_with_config(recall_indicator=False)
++        p.queue_prefetch("test")
++        if p._prefetch_thread:
++            p._prefetch_thread.join(timeout=5.0)
++        p.prefetch("test")
++        # Memory was injected, but the indicator is turned off.
++        assert p._last_recall_returned is True
++        assert p.recall_status() is None
++
++    def test_reflect_mode_reports_generic_count(self, provider_with_config):
++        p = provider_with_config(recall_prefetch_method="reflect")
++        p.queue_prefetch("test")
++        if p._prefetch_thread:
++            p._prefetch_thread.join(timeout=5.0)
++        p.prefetch("test")
++        status = p.recall_status()
++        assert status is not None
++        # Reflect synthesizes across memories → no discrete count (0).
++        assert status.count == 0
++
++
+ # ---------------------------------------------------------------------------
+ # sync_turn tests
+ # ---------------------------------------------------------------------------
+@@ -587,6 +719,62 @@ class TestSyncTurn:
+         assert p2._document_id.startswith("resumed-session-")
+ 
+ 
++# ---------------------------------------------------------------------------
++# retain indicator ("saving to memory") tests
++# ---------------------------------------------------------------------------
++
++
++class TestRetainIndicator:
++    _SAVING = "👁️ Hindsight — saving to memory…"
++
++    def test_emits_saving_on_dispatch(self, provider_with_config):
++        calls = []
++        p = provider_with_config(retain_async=False)
++        p._status_callback = calls.append
++        p.sync_turn("hello", "hi")
++        p._retain_queue.join()
++        assert self._SAVING in calls
++
++    def test_suppressed_when_indicator_off(self, provider_with_config):
++        calls = []
++        p = provider_with_config(retain_indicator=False, retain_async=False)
++        p._status_callback = calls.append
++        p.sync_turn("hello", "hi")
++        p._retain_queue.join()
++        assert calls == []
++
++    def test_no_emit_when_auto_retain_off(self, provider_with_config):
++        calls = []
++        p = provider_with_config(auto_retain=False)
++        p._status_callback = calls.append
++        p.sync_turn("hello", "hi")  # returns early — nothing dispatched
++        assert calls == []
++
++    def test_no_emit_on_buffered_turn(self, provider_with_config):
++        # retain_every_n_turns=2: turn 1 buffers (no write, no line),
++        # turn 2 flushes (one line) — "saving" only fires on a real write.
++        calls = []
++        p = provider_with_config(retain_every_n_turns=2, retain_async=False)
++        p._status_callback = calls.append
++        p.sync_turn("t1-u", "t1-a")
++        assert calls == []
++        p.sync_turn("t2-u", "t2-a")
++        p._retain_queue.join()
++        assert calls == [self._SAVING]
++
++    def test_no_crash_without_callback(self, provider_with_config):
++        p = provider_with_config(retain_async=False)
++        assert p._status_callback is None
++        p.sync_turn("hello", "hi")  # must not raise
++        p._retain_queue.join()
++
++    def test_status_callback_wired_from_initialize(self, tmp_path, monkeypatch):
++        cb = lambda _m: None
++        p = _provider_for_mode(tmp_path, monkeypatch, "cloud")
++        p.initialize(session_id="s", hermes_home=str(tmp_path), status_callback=cb)
++        assert p._status_callback is cb
++
++
+ # ---------------------------------------------------------------------------
+ # Shutdown / writer tests
+ # ---------------------------------------------------------------------------
+diff --git a/tests/plugins/memory/test_hindsight_templates.py b/tests/plugins/memory/test_hindsight_templates.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..32bc9d3013a80a4e08c819b2e183d4f0c21dc9ed
+--- /dev/null
++++ b/tests/plugins/memory/test_hindsight_templates.py
+@@ -0,0 +1,260 @@
++"""Tests for the Hindsight setup-wizard starter-template step."""
++
++import json
++from contextlib import contextmanager
++
++import pytest
++
++from plugins.memory.hindsight import templates as tpl
++
++
++_CATALOG = {
++    "templates": [
++        {"id": "conversation", "name": "Conversation", "integrations": ["litellm", "hermes"],
++         "manifest_file": "templates/conversation.json"},
++        {"id": "coding-agent", "name": "Coding Agent", "integrations": ["claude-code"],
++         "manifest_file": "templates/coding-agent.json"},
++        {"id": "hermes-gateway-bot", "name": "Gateway Bot", "integrations": ["hermes"],
++         "manifest_file": "templates/hermes-gateway-bot.json"},
++    ]
++}
++
++
++def test_fetch_hermes_templates_filters_to_hermes(monkeypatch):
++    monkeypatch.setattr(tpl, "_get_json", lambda url: _CATALOG)
++    entries = tpl.fetch_hermes_templates("https://example/templates.json")
++    ids = [e["id"] for e in entries]
++    assert ids == ["conversation", "hermes-gateway-bot"]  # coding-agent excluded
++
++
++def test_fetch_manifest_resolves_relative_url(monkeypatch):
++    seen = {}
++
++    def _fake(url):
++        seen["url"] = url
++        return {"version": "1"}
++
++    monkeypatch.setattr(tpl, "_get_json", _fake)
++    tpl.fetch_manifest(
++        {"manifest_file": "templates/hermes-gateway-bot.json"},
++        "https://raw.example/data/templates.json",
++    )
++    assert seen["url"] == "https://raw.example/data/templates/hermes-gateway-bot.json"
++
++
++def test_apply_template_posts_to_import_endpoint(monkeypatch):
++    captured = {}
++
++    @contextmanager
++    def _fake_urlopen(req, timeout=None):
++        captured["url"] = req.full_url
++        captured["method"] = req.get_method()
++        captured["auth"] = req.get_header("Authorization")
++        captured["body"] = json.loads(req.data.decode("utf-8"))
++
++        class _Resp:
++            def read(self):
++                return b""
++
++        yield _Resp()
++
++    monkeypatch.setattr(tpl.urllib.request, "urlopen", _fake_urlopen)
++    tpl.apply_template("https://api.hindsight.vectorize.io/", "hermes", "hsk_abc", {"version": "1"})
++
++    assert captured["url"] == "https://api.hindsight.vectorize.io/v1/default/banks/hermes/import"
++    assert captured["method"] == "POST"
++    assert captured["auth"] == "Bearer hsk_abc"
++    assert captured["body"] == {"version": "1"}
++
++
++def test_apply_template_omits_auth_when_no_key(monkeypatch):
++    captured = {}
++
++    @contextmanager
++    def _fake_urlopen(req, timeout=None):
++        captured["auth"] = req.get_header("Authorization")
++
++        class _Resp:
++            def read(self):
++                return b""
++
++        yield _Resp()
++
++    monkeypatch.setattr(tpl.urllib.request, "urlopen", _fake_urlopen)
++    tpl.apply_template("http://localhost:8888", "hermes", None, {"version": "1"})
++    assert captured["auth"] is None
++
++
++def _select_returning(idx):
++    def _select(title, items, default=0, cancel_returns=None):
++        return idx
++    return _select
++
++
++def _select_seq(*returns):
++    it = iter(returns)
++
++    def _select(title, items, default=0, cancel_returns=None):
++        return next(it)
++
++    return _select
++
++
++def test_supported_for_mode():
++    assert tpl.supported_for_mode("cloud") is True
++    assert tpl.supported_for_mode("local_external") is True
++    assert tpl.supported_for_mode("local_embedded") is False
++    assert tpl.supported_for_mode("local") is False
++
++
++def test_run_template_step_applies_selected(monkeypatch):
++    monkeypatch.setattr(tpl, "fetch_hermes_templates", lambda url=None: [
++        {"id": "hermes-gateway-bot", "name": "Gateway Bot", "manifest_file": "templates/x.json"},
++    ])
++    monkeypatch.setattr(tpl, "fetch_manifest", lambda entry, url=None: {"version": "1"})
++    monkeypatch.setattr(tpl, "probe_existing_customization", lambda *a: False)
++    applied = {}
++    monkeypatch.setattr(tpl, "apply_template",
++                        lambda api_url, bank_id, api_key, manifest: applied.update(bank=bank_id))
++
++    result = tpl.run_template_step(
++        api_url="https://api", bank_id="hermes", api_key="k",
++        select=_select_returning(0), cancelled=-1, log=lambda *_: None,
++    )
++    assert result == "hermes-gateway-bot"
++    assert applied["bank"] == "hermes"
++
++
++def test_run_template_step_blank_selection_skips(monkeypatch):
++    entries = [{"id": "hermes-gateway-bot", "name": "Gateway Bot", "manifest_file": "templates/x.json"}]
++    monkeypatch.setattr(tpl, "fetch_hermes_templates", lambda url=None: entries)
++    called = {"applied": False}
++    monkeypatch.setattr(tpl, "apply_template",
++                        lambda *a, **k: called.update(applied=True))
++    # index len(entries) == the "Blank" row
++    result = tpl.run_template_step(
++        api_url="https://api", bank_id="hermes", api_key="k",
++        select=_select_returning(len(entries)), cancelled=-1, log=lambda *_: None,
++    )
++    assert result is None
++    assert called["applied"] is False
++
++
++def test_run_template_step_no_templates_is_noop(monkeypatch):
++    monkeypatch.setattr(tpl, "fetch_hermes_templates", lambda url=None: [])
++    result = tpl.run_template_step(
++        api_url="https://api", bank_id="hermes", api_key="k",
++        select=_select_returning(0), cancelled=-1, log=lambda *_: None,
++    )
++    assert result is None
++
++
++def test_run_template_step_swallows_fetch_errors(monkeypatch):
++    def _boom(url=None):
++        raise RuntimeError("network down")
++
++    monkeypatch.setattr(tpl, "fetch_hermes_templates", _boom)
++    # must not raise
++    assert tpl.run_template_step(
++        api_url="https://api", bank_id="hermes", api_key="k",
++        select=_select_returning(0), cancelled=-1, log=lambda *_: None,
++    ) is None
++
++
++def test_run_template_step_swallows_apply_errors(monkeypatch):
++    # gap 1: a failed apply (e.g. 401 for an OAuth-only user) must not crash setup.
++    import urllib.error
++
++    monkeypatch.setattr(tpl, "fetch_hermes_templates", lambda url=None: [
++        {"id": "hermes-gateway-bot", "name": "Gateway Bot", "manifest_file": "templates/x.json"},
++    ])
++    monkeypatch.setattr(tpl, "fetch_manifest", lambda entry, url=None: {"version": "1"})
++    monkeypatch.setattr(tpl, "probe_existing_customization", lambda *a: False)
++
++    def _raise(*a, **k):
++        raise urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
++
++    monkeypatch.setattr(tpl, "apply_template", _raise)
++    logs = []
++    result = tpl.run_template_step(
++        api_url="https://api", bank_id="hermes", api_key=None,
++        select=_select_returning(0), cancelled=-1, log=logs.append,
++    )
++    assert result is None
++    assert any("Could not apply" in line for line in logs)
++
++
++def _fake_urlopen(payload):
++    @contextmanager
++    def _cm(req, timeout=None):
++        class _Resp:
++            def read(self):
++                return json.dumps(payload).encode("utf-8")
++
++        yield _Resp()
++
++    return _cm
++
++
++def test_probe_existing_customization_true_when_bank_has_config(monkeypatch):
++    monkeypatch.setattr(tpl.urllib.request, "urlopen",
++                        _fake_urlopen({"version": "1", "bank": {"reflect_mission": "x"}}))
++    assert tpl.probe_existing_customization("https://api", "hermes", "k") is True
++
++
++def test_probe_existing_customization_false_when_empty(monkeypatch):
++    monkeypatch.setattr(tpl.urllib.request, "urlopen",
++                        _fake_urlopen({"version": "1"}))
++    assert tpl.probe_existing_customization("https://api", "hermes", "k") is False
++
++
++def test_probe_existing_customization_false_on_error(monkeypatch):
++    def _boom(req, timeout=None):
++        raise OSError("no bank")
++
++    monkeypatch.setattr(tpl.urllib.request, "urlopen", _boom)
++    assert tpl.probe_existing_customization("https://api", "missing", None) is False
++
++
++def _wire_apply(monkeypatch, customized):
++    monkeypatch.setattr(tpl, "fetch_hermes_templates", lambda url=None: [
++        {"id": "hermes-gateway-bot", "name": "Gateway Bot", "manifest_file": "templates/x.json"},
++    ])
++    monkeypatch.setattr(tpl, "fetch_manifest", lambda entry, url=None: {"version": "1"})
++    monkeypatch.setattr(tpl, "probe_existing_customization", lambda *a: customized)
++    called = {"applied": False}
++    monkeypatch.setattr(tpl, "apply_template", lambda *a, **k: called.update(applied=True))
++    return called
++
++
++def test_warns_and_keeps_existing_when_declined(monkeypatch):
++    called = _wire_apply(monkeypatch, customized=True)
++    # first select = pick template (0); second select = confirm -> "Keep existing" (1)
++    result = tpl.run_template_step(
++        api_url="https://api", bank_id="hermes", api_key="k",
++        select=_select_seq(0, 1), cancelled=-1, log=lambda *_: None,
++    )
++    assert result is None
++    assert called["applied"] is False
++
++
++def test_warns_then_applies_when_confirmed(monkeypatch):
++    called = _wire_apply(monkeypatch, customized=True)
++    # pick template (0), confirm "Apply" (0)
++    result = tpl.run_template_step(
++        api_url="https://api", bank_id="hermes", api_key="k",
++        select=_select_seq(0, 0), cancelled=-1, log=lambda *_: None,
++    )
++    assert result == "hermes-gateway-bot"
++    assert called["applied"] is True
++
++
++def test_fresh_bank_skips_the_warning(monkeypatch):
++    called = _wire_apply(monkeypatch, customized=False)
++    # only ONE select call (no confirm) — _select_seq with a single value proves it
++    result = tpl.run_template_step(
++        api_url="https://api", bank_id="hermes", api_key="k",
++        select=_select_seq(0), cancelled=-1, log=lambda *_: None,
++    )
++    assert result == "hermes-gateway-bot"
++    assert called["applied"] is True

@@ -17,12 +17,27 @@ retention_tag = "pr/74379/head-c778c87f9bc0d8f915315df7c45e1a30ed98a8b8"
 contributor_repo = "https://github.com/benfrank241/hermes-agent"
 contributor_ref = "feat/hindsight-memory-improvements"
 head_sha = "c778c87f9bc0d8f915315df7c45e1a30ed98a8b8"
-materialization = "pending-phase-2"
-head_tree = "pending-phase-2"
+head_tree = "037f3842a81e0d4727caf2706e7b52572d71f55b"
 patch_base = "8defb9fd60bebe2802eaab7c57fa2ee6a4ff6281"
-patch_file = "pending-phase-2"
-patch_sha256 = "pending-phase-2"
-changed_paths = []
+patch_file = "patches/74379-8defb9fd60be..c778c87f9bc0.patch"
+patch_sha256 = "b7f2c29c02817932a63e8186262efcee86389745525cb04cb00615ce9314b8c0"
+changed_paths = [
+  "agent/agent_init.py",
+  "agent/memory_manager.py",
+  "agent/memory_provider.py",
+  "agent/turn_context.py",
+  "hermes_cli/memory_setup.py",
+  "plugins/memory/hindsight/README.md",
+  "plugins/memory/hindsight/__init__.py",
+  "plugins/memory/hindsight/templates.py",
+  "tests/agent/test_memory_provider_unavailable_warning.py",
+  "tests/agent/test_memory_recall_indicator.py",
+  "tests/agent/test_turn_context.py",
+  "tests/hermes_cli/test_memory_status_env_hint.py",
+  "tests/plugins/memory/test_hindsight_local_runtime_hint.py",
+  "tests/plugins/memory/test_hindsight_provider.py",
+  "tests/plugins/memory/test_hindsight_templates.py",
+]
 order_rationale = "first: the upstream change the owned follow-up depends on"
 
 [[entry]]
@@ -30,11 +45,11 @@ index = 2
 kind = "owned-followup"
 title = "generic gateway retain feedback on top of PR 74379"
 spec = "FOLLOWUP.md"
-materialization = "pending-phase-2"
-retention_tag = "pending-phase-2"
-head_sha = "pending-phase-2"
-head_tree = "pending-phase-2"
-patch_base = "pending-phase-2"
+materialization = "pending-phase-3"
+retention_tag = "pending-phase-3"
+head_sha = "pending-phase-3"
+head_tree = "pending-phase-3"
+patch_base = "pending-phase-3"
 changed_paths = []
 depends_on = [1]
 order_rationale = "modifies call sites introduced by entry 1"
