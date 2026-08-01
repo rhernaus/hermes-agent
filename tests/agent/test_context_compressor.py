@@ -2431,7 +2431,56 @@ class TestDoubleCompactionSummaryRole:
 
 class TestSummaryPromptBounding:
 
+    def test_complete_coverage_critical_marker(self):
+        """Aggregate bounding must not omit serialized turns from the middle."""
+        c = ContextCompressor(
+            model="test",
+            quiet_mode=True,
+            config_context_length=272000,
+        )
+        cap = c._SUMMARY_INPUT_MAX_CHARS
+        critical_marker = "CRITICAL_MIDDLE_MARKER_73036"
+        turn_markers = [f"SOURCE_TURN_{i:02d}" for i in range(52)]
+        turns = []
+        for i, marker in enumerate(turn_markers):
+            middle_marker = f" {critical_marker}" if i == 26 else ""
+            turns.append({
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"{marker}{middle_marker} " + (chr(65 + i % 26) * 7000),
+            })
 
+        captured_source_blocks = []
+
+        def fake_call_llm(**kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            if "TURNS TO SUMMARIZE:\n" in prompt:
+                source = prompt.split("TURNS TO SUMMARIZE:\n", 1)[1].split(
+                    "\n\nUse this exact structure:", 1,
+                )[0]
+            else:
+                source = prompt.split("NEW TURNS TO INCORPORATE:\n", 1)[1].split(
+                    "\n\nUpdate the summary using this exact structure.", 1,
+                )[0]
+            captured_source_blocks.append(source)
+            response = MagicMock()
+            response.choices = [MagicMock()]
+            response.choices[0].message.content = "bounded summary"
+            return response
+
+        with patch(
+            "agent.context_compressor.call_llm", side_effect=fake_call_llm,
+        ):
+            summary = c._generate_summary(turns)
+
+        assert summary is not None
+        combined_source = "".join(captured_source_blocks)
+        assert critical_marker in combined_source, (
+            "the critical marker in the aggregate middle was omitted"
+        )
+        assert all(len(block) <= cap for block in captured_source_blocks)
+        assert all(combined_source.count(marker) == 1 for marker in turn_markers)
+        positions = [combined_source.index(marker) for marker in turn_markers]
+        assert positions == sorted(positions)
 
 
     def test_iterative_update_path_is_bounded(self):
