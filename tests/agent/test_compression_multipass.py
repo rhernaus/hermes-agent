@@ -1,235 +1,389 @@
-"""Whole-turn, transactional context-compression pass coverage."""
+"""Observable contracts for bounded, transactional context-summary passes."""
 
+from asyncio import CancelledError
+from copy import deepcopy
+import re
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import agent.context_compressor as cc
-import pytest
-from agent.context_compressor import ContextCompressor
+from agent.context_compressor import (
+    COMPRESSED_SUMMARY_METADATA_KEY,
+    HISTORICAL_TASK_HEADING,
+    SUMMARY_PREFIX,
+    ContextCompressor,
+)
 
 
 def _make(limit: int = 1_000) -> ContextCompressor:
-    with patch.object(cc, "get_model_context_length", return_value=128_000):
-        compressor = ContextCompressor(
-            model="test/model",
-            threshold_percent=0.85,
-            quiet_mode=True,
-        )
+    compressor = ContextCompressor(
+        model="test/model",
+        threshold_percent=0.85,
+        protect_first_n=0,
+        protect_last_n=1,
+        quiet_mode=True,
+        config_context_length=128_000,
+    )
     compressor._SUMMARY_INPUT_MAX_CHARS = limit
     return compressor
 
 
-def _turns(count: int = 6) -> list[dict]:
+def _response(content: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+    )
+
+
+def _summary_body(label: str, *, no_user: bool = False) -> str:
+    task = (
+        "None. This session contains no user-authored turns."
+        if no_user
+        else label
+    )
+    return f"{HISTORICAL_TASK_HEADING}\n{task}\n\n## Goal\n{label}"
+
+
+def _source_block(prompt: str) -> str:
+    if "NEW TURNS TO INCORPORATE:\n" in prompt:
+        return prompt.split("NEW TURNS TO INCORPORATE:\n", 1)[1].split(
+            "\n\nUpdate the summary using this exact structure.", 1,
+        )[0]
+    return prompt.split("TURNS TO SUMMARIZE:\n", 1)[1].split(
+        "\n\nUse this exact structure:", 1,
+    )[0]
+
+
+def _turns(count: int = 6, size: int = 360) -> list[dict]:
     return [
         {
             "role": "user" if index % 2 == 0 else "assistant",
-            "content": f"turn-{index}-" + ("x" * 360),
+            "content": f"TURN_{index} " + (chr(65 + index) * size),
         }
         for index in range(count)
     ]
 
 
-def test_splitter_keeps_regular_turns_intact_and_in_order():
+def test_ordered_passes_feed_each_tentative_summary_into_the_next_request():
     compressor = _make()
     turns = _turns()
+    prompts: list[str] = []
+    returned_bodies: list[str] = []
 
-    chunks = compressor._split_turns_for_summary(turns)
+    def call_llm(**kwargs):
+        prompts.append(kwargs["messages"][0]["content"])
+        body = _summary_body(f"tentative-{len(prompts)}")
+        returned_bodies.append(body)
+        return _response(body)
 
-    assert len(chunks) > 1
-    assert [turn for chunk in chunks for turn in chunk] == turns
-    assert all(
-        len(compressor._serialize_for_summary(chunk))
-        <= compressor._SUMMARY_INPUT_MAX_CHARS
-        for chunk in chunks
+    with patch("agent.context_compressor.call_llm", side_effect=call_llm):
+        summary = compressor._generate_summary(turns)
+
+    assert summary is not None
+    assert len(prompts) > 1
+    sources = [_source_block(prompt) for prompt in prompts]
+    combined = "".join(sources)
+    positions = [combined.index(f"TURN_{index}") for index in range(len(turns))]
+    assert positions == sorted(positions)
+    assert all(combined.count(f"TURN_{index}") == 1 for index in range(len(turns)))
+    assert all(len(source) <= compressor._SUMMARY_INPUT_MAX_CHARS for source in sources)
+    for index, prompt in enumerate(prompts[1:], start=1):
+        assert returned_bodies[index - 1] in prompt
+
+
+def test_final_assistant_only_pass_uses_complete_window_facts():
+    compressor = _make(limit=6_000)
+    marker = (
+        "[SKILL_PRUNED: content lost in compression; "
+        "reload with skill_view(name='window-skill')]"
     )
-
-
-def test_splitter_preserves_oversized_serialized_turn_without_user_attribution():
-    compressor = _make()
-    turn = {
-        "role": "assistant",
-        "content": "completed calls",
-        "tool_calls": [
-            {
-                "id": f"call-{index}",
-                "function": {
-                    "name": "terminal",
-                    "arguments": "x" * 900,
-                },
-            }
-            for index in range(12)
+    turns = [
+        {"role": "user", "content": "LATEST_FULL_WINDOW_USER " + ("u" * 7_000)},
+        {"role": "assistant", "content": marker + ("a" * 7_000)},
+        *[
+            {"role": "assistant", "content": f"assistant-{index} " + ("z" * 7_000)}
+            for index in range(4)
         ],
-    }
-    rendered = compressor._serialize_for_summary([turn])
-    assert len(rendered) > compressor._SUMMARY_INPUT_MAX_CHARS
-
-    chunks = compressor._split_turns_for_summary([turn])
-    fragments = [fragment for chunk in chunks for fragment in chunk]
-
-    assert len(fragments) > 1
-    assert all(fragment["role"] == "assistant" for fragment in fragments)
-    recovered = "".join(
-        fragment["content"].split("source material only]\n", 1)[1]
-        for fragment in fragments
-    )
-    assert recovered == rendered
-    assert all(
-        len(compressor._serialize_for_summary(chunk))
-        <= compressor._SUMMARY_INPUT_MAX_CHARS
-        for chunk in chunks
-    )
-
-
-def test_multipass_commits_only_the_final_summary():
-    compressor = _make()
-    compressor._previous_summary = "seed"
-    compressor._active_compression_telemetry = {}
-    calls: list[list[dict]] = []
-
-    def generate(chunk, **_kwargs):
-        calls.append(chunk)
-        compressor._previous_summary = f"pass-{len(calls)}"
-        return f"summary-{len(calls)}"
-
-    with patch.object(
-        compressor,
-        "_generate_summary",
-        side_effect=generate,
-    ):
-        summary = compressor._generate_summary_in_passes(_turns())
-
-    assert len(calls) > 1
-    assert [turn for chunk in calls for turn in chunk] == _turns()
-    assert summary == f"summary-{len(calls)}"
-    assert compressor._previous_summary == f"pass-{len(calls)}"
-    assert compressor._active_compression_telemetry["chunking"] is True
-    assert compressor._active_compression_telemetry["chunk_count"] == len(calls)
-
-
-def test_multipass_rolls_back_partial_summary_but_keeps_failure_state():
-    compressor = _make()
-    secret = "sk-proj-" + ("a" * 40)
-    compressor._previous_summary = f"seed {secret}"
-    calls = 0
-
-    def generate(_chunk, **_kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            compressor._previous_summary = "partial"
-            return "summary-1"
-        compressor._last_summary_error = "second pass failed"
-        return None
-
-    with patch.object(
-        compressor,
-        "_generate_summary",
-        side_effect=generate,
-    ):
-        assert compressor._generate_summary_in_passes(_turns()) is None
-    assert calls == 2
-    assert compressor._previous_summary.startswith("seed ")
-    assert secret not in compressor._previous_summary
-    assert compressor._last_summary_error == "second pass failed"
-
-
-def test_multipass_rolls_back_partial_summary_on_interruption():
-    compressor = _make()
-    compressor._previous_summary = "seed"
-    calls = 0
-
-    def generate(_chunk, **_kwargs):
-        nonlocal calls
-        calls += 1
-        compressor._previous_summary = "partial"
-        if calls == 2:
-            raise KeyboardInterrupt
-        return "summary-1"
-
-    with (
-        patch.object(
-            compressor,
-            "_generate_summary",
-            side_effect=generate,
-        ),
-        patch.object(cc, "_redact_compaction_text", side_effect=lambda text: text),
-        pytest.raises(KeyboardInterrupt),
-    ):
-        compressor._generate_summary_in_passes(_turns())
-
-    assert calls == 2
-    assert compressor._previous_summary == "seed"
-
-
-def test_single_pass_keeps_existing_summary_path():
-    compressor = _make()
-    calls = []
-
-    def generate(chunk, **_kwargs):
-        calls.append(chunk)
-        return "summary"
-
-    turns = _turns(2)
-
-    with patch.object(
-        compressor,
-        "_generate_summary",
-        side_effect=generate,
-    ):
-        assert compressor._generate_summary_in_passes(turns) == "summary"
-    assert calls == [turns]
-
-
-def test_real_summary_path_sends_every_turn_without_aggregate_omission():
-    compressor = _make()
-    compressor._summary_has_user_turn = True
+    ]
     prompts: list[str] = []
 
     def call_llm(**kwargs):
         prompts.append(kwargs["messages"][0]["content"])
-        return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content=(
-                            "## Active Task\nContinue.\n\n"
-                            "## Goal\nPreserve the historical source."
-                        )
-                    )
-                )
-            ]
-        )
+        return _response(_summary_body(f"pass-{len(prompts)}"))
 
-    with (
-        patch.object(
-            ContextCompressor,
-            "_SUMMARY_INPUT_MAX_CHARS",
-            compressor._SUMMARY_INPUT_MAX_CHARS,
-        ),
-        patch.object(cc, "call_llm", side_effect=call_llm),
-    ):
-        bounded_once = compressor._bound_summary_input(
-            compressor._serialize_for_summary(_turns())
-        )
-        assert "summary input truncated" in bounded_once
-        assert compressor._generate_summary_in_passes(_turns()) is not None
+    with patch("agent.context_compressor.call_llm", side_effect=call_llm):
+        summary = compressor._generate_summary(turns)
 
-    assert len(prompts) > 1
-    current_source_sections: list[str] = []
+    assert summary is not None
+    sources = [_source_block(prompt) for prompt in prompts]
+    assert len(sources) > 1
+    assert "[USER]:" not in sources[-1]
+    budgets = []
     for prompt in prompts:
-        if "NEW TURNS TO INCORPORATE:" in prompt:
-            source = prompt.split("NEW TURNS TO INCORPORATE:", 1)[1]
-            source = source.split("\n\nUpdate the summary", 1)[0]
-        else:
-            source = prompt.split("TURNS TO SUMMARIZE:", 1)[1]
-            source = source.split("\n\nUse this exact structure:", 1)[0]
-        current_source_sections.append(source)
+        match = re.search(r"Target ~(\d+) tokens", prompt)
+        assert match is not None
+        budgets.append(int(match.group(1)))
+    assert len(set(budgets)) == 1
+    assert budgets[0] > 2_000
+    assert "LATEST_FULL_WINDOW_USER" in summary
+    assert marker in summary
 
-    current_source = "\n".join(current_source_sections)
-    assert "summary input truncated" not in current_source
-    for index in range(6):
-        assert current_source.count(f"turn-{index}-") == 1
-    assert all(
-        "PREVIOUS SUMMARY:" in prompt
-        for prompt in prompts[1:]
+
+def test_later_pass_failure_rolls_back_normalized_state_and_source_objects():
+    compressor = _make()
+    secret = "sk-proj-" + ("a" * 40)
+    compressor._previous_summary = f"seed {secret}"
+    turns = _turns()
+    before = deepcopy(turns)
+    member_ids = [id(turn) for turn in turns]
+    calls = 0
+
+    def call_llm(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("second pass failed")
+        return _response(_summary_body("tentative partial"))
+
+    with patch("agent.context_compressor.call_llm", side_effect=call_llm):
+        summary = compressor._generate_summary(turns)
+
+    assert summary is None
+    assert calls == 2
+    assert compressor._previous_summary.startswith("seed ")
+    assert secret not in compressor._previous_summary
+    assert compressor._last_summary_error == "second pass failed"
+    assert compressor._summary_failure_cooldown_until > 0
+    assert turns == before
+    assert [id(turn) for turn in turns] == member_ids
+
+
+def test_later_pass_cancellation_returns_none_and_rolls_back_tentative_state():
+    compressor = _make()
+    compressor._previous_summary = "normalized seed"
+    compressor._last_summary_error = "pre-existing diagnostic"
+    turns = _turns()
+    before = deepcopy(turns)
+    member_ids = [id(turn) for turn in turns]
+    calls = 0
+
+    def call_llm(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise CancelledError
+        return _response(_summary_body("tentative partial"))
+
+    with patch("agent.context_compressor.call_llm", side_effect=call_llm):
+        summary = compressor._generate_summary(turns)
+
+    assert summary is None
+    assert calls == 2
+    assert compressor._previous_summary == "normalized seed"
+    assert compressor._last_summary_error == "pre-existing diagnostic"
+    assert turns == before
+    assert [id(turn) for turn in turns] == member_ids
+
+
+def test_fitting_completed_tool_group_stays_together_at_a_pass_boundary():
+    compressor = _make()
+    turns = [
+        {"role": "user", "content": "before-tools " + ("u" * 700)},
+        {
+            "role": "assistant",
+            "content": "calling terminal",
+            "tool_calls": [{
+                "id": "call-1",
+                "function": {"name": "terminal", "arguments": '{"cmd":"pwd"}'},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "/workspace\n" + ("t" * 300)},
+        {"role": "assistant", "content": "tool completed"},
+    ]
+    prompts: list[str] = []
+
+    def call_llm(**kwargs):
+        prompts.append(kwargs["messages"][0]["content"])
+        return _response(_summary_body(f"pass-{len(prompts)}"))
+
+    with patch("agent.context_compressor.call_llm", side_effect=call_llm):
+        assert compressor._generate_summary(turns) is not None
+
+    sources = [_source_block(prompt) for prompt in prompts]
+    tool_sources = [source for source in sources if "terminal(" in source]
+    assert len(tool_sources) == 1
+    assert "[TOOL RESULT call-1]" in tool_sources[0]
+    combined = "".join(sources)
+    assert combined.count("terminal(") == 1
+    assert combined.count("[TOOL RESULT call-1]") == 1
+    assert combined.index("terminal(") < combined.index("[TOOL RESULT call-1]")
+
+
+def test_oversized_assistant_row_fragments_reconstruct_provider_source_bytes():
+    turn = {
+        "role": "assistant",
+        "content": (
+            "before <think>discard scratch reasoning</think> after "
+            + ("x" * 7_000)
+        ),
+    }
+
+    baseline = _make(limit=10_000)
+    baseline._summary_has_user_turn = False
+    baseline_prompts: list[str] = []
+
+    def baseline_call(**kwargs):
+        baseline_prompts.append(kwargs["messages"][0]["content"])
+        return _response(_summary_body("baseline", no_user=True))
+
+    with patch("agent.context_compressor.call_llm", side_effect=baseline_call):
+        assert baseline._generate_summary([turn]) is not None
+    expected = _source_block(baseline_prompts[0])
+
+    fragmented = _make(limit=600)
+    fragmented._summary_has_user_turn = False
+    fragment_prompts: list[str] = []
+
+    def fragment_call(**kwargs):
+        fragment_prompts.append(kwargs["messages"][0]["content"])
+        return _response(_summary_body("fragmented", no_user=True))
+
+    with patch("agent.context_compressor.call_llm", side_effect=fragment_call):
+        assert fragmented._generate_summary([turn]) is not None
+
+    blocks = [_source_block(prompt) for prompt in fragment_prompts]
+    label = re.compile(r"^\[ASSISTANT FRAGMENT \d+/\d+\]: ")
+    assert len(blocks) > 1
+    assert all(label.match(block) for block in blocks)
+    recovered = "".join(label.sub("", block, count=1) for block in blocks)
+    assert recovered == expected
+    assert all(len(block) <= fragmented._SUMMARY_INPUT_MAX_CHARS for block in blocks)
+
+
+def test_non_edge_pruned_skill_survives_while_every_pass_stays_redacted():
+    compressor = _make(limit=700)
+    secret = "sk-proj-" + ("s" * 40)
+    marker = (
+        "[SKILL_PRUNED: content lost in compression; "
+        "reload with skill_view(name='middle-skill')]"
     )
+    turns = [
+        {"role": "user", "content": f"first {secret} " + ("a" * 500)},
+        {"role": "assistant", "content": f"middle {marker} " + ("b" * 500)},
+        {"role": "user", "content": f"last {secret} " + ("c" * 500)},
+    ]
+    prompts: list[str] = []
+
+    def call_llm(**kwargs):
+        prompts.append(kwargs["messages"][0]["content"])
+        return _response(_summary_body(f"pass-{len(prompts)}") + f"\n{secret}")
+
+    with patch("agent.context_compressor.call_llm", side_effect=call_llm):
+        summary = compressor._generate_summary(turns)
+
+    assert summary is not None
+    sources = [_source_block(prompt) for prompt in prompts]
+    marker_pass = next(index for index, source in enumerate(sources) if marker in source)
+    assert 0 < marker_pass < len(sources) - 1
+    assert all(secret not in prompt for prompt in prompts)
+    assert secret not in summary
+    assert marker in summary
+    assert all(marker in prompt for prompt in prompts[marker_pass + 1:])
+
+
+def test_restart_rehydrates_one_handoff_and_cross_session_guard_clears_it():
+    critical = "RESTART_CRITICAL_MARKER"
+
+    def conversation(prefix: str, *, include_critical: bool) -> list[dict]:
+        rows = [{"role": "system", "content": f"{prefix} system"}]
+        for index in range(12):
+            marker = f" {critical}" if include_critical and index == 4 else ""
+            rows.append({
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"{prefix}-{index}{marker} " + ("x" * 900),
+            })
+        return rows
+
+    def configure(compressor: ContextCompressor) -> None:
+        compressor._tail_token_budget = 600
+        compressor.last_prompt_tokens = 100_000
+
+    prompts: list[str] = []
+
+    def call_llm(**kwargs):
+        prompt = kwargs["messages"][0]["content"]
+        prompts.append(prompt)
+        carried = f" {critical}" if critical in prompt else ""
+        return _response(_summary_body(f"cycle-{len(prompts)}{carried}"))
+
+    first = _make(limit=1_000)
+    configure(first)
+    with patch("agent.context_compressor.call_llm", side_effect=call_llm):
+        compacted = first.compress(
+            conversation("first", include_critical=True),
+            current_tokens=100_000,
+            force=True,
+        )
+    assert sum(bool(row.get(COMPRESSED_SUMMARY_METADATA_KEY)) for row in compacted) == 1
+    assert critical in "\n".join(str(row.get("content") or "") for row in compacted)
+
+    restarted = _make(limit=1_000)
+    configure(restarted)
+    resumed = compacted + conversation("resumed", include_critical=False)[1:]
+    with patch("agent.context_compressor.call_llm", side_effect=call_llm):
+        recompressed = restarted.compress(
+            resumed,
+            current_tokens=100_000,
+            force=True,
+        )
+    joined = "\n".join(str(row.get("content") or "") for row in recompressed)
+    assert sum(bool(row.get(COMPRESSED_SUMMARY_METADATA_KEY)) for row in recompressed) == 1
+    assert joined.count(SUMMARY_PREFIX) == 1
+    assert critical in joined
+
+    unrelated_prompts: list[str] = []
+
+    def unrelated_call(**kwargs):
+        unrelated_prompts.append(kwargs["messages"][0]["content"])
+        return _response(_summary_body("unrelated session"))
+
+    with patch("agent.context_compressor.call_llm", side_effect=unrelated_call):
+        unrelated_result = restarted.compress(
+            conversation("unrelated", include_critical=False),
+            current_tokens=100_000,
+            force=True,
+        )
+    assert all(critical not in prompt for prompt in unrelated_prompts)
+    assert critical not in "\n".join(
+        str(row.get("content") or "") for row in unrelated_result
+    )
+
+
+def test_below_cap_path_keeps_single_request_result_state_and_wire_contract():
+    compressor = _make(limit=10_000)
+    compressor._active_compression_telemetry = {}
+    compressor._previous_summary = "prior summary"
+    compressor._last_summary_error = "old error"
+    turns = [
+        {"role": "user", "content": "first request"},
+        {"role": "assistant", "content": "first response"},
+    ]
+    calls: list[dict] = []
+    response_body = _summary_body("updated result")
+
+    def call_llm(**kwargs):
+        calls.append(kwargs)
+        return _response(response_body)
+
+    with patch("agent.context_compressor.call_llm", side_effect=call_llm):
+        summary = compressor._generate_summary(turns)
+
+    assert len(calls) == 1
+    assert set(calls[0]) == {"task", "main_runtime", "messages"}
+    assert "max_tokens" not in calls[0]
+    prompt = calls[0]["messages"][0]["content"]
+    assert _source_block(prompt) == "[USER]: first request\n\n[ASSISTANT]: first response"
+    assert prompt.count("prior summary") == 1
+    assert summary is not None and summary.startswith(SUMMARY_PREFIX)
+    assert compressor._previous_summary and summary.endswith(compressor._previous_summary)
+    assert compressor._last_summary_error is None
+    assert "chunking" not in compressor._active_compression_telemetry
+    assert "chunk_count" not in compressor._active_compression_telemetry

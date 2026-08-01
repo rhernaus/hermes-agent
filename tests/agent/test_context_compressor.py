@@ -2490,8 +2490,11 @@ class TestSummaryPromptBounding:
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = "updated summary"
 
-        with patch("agent.context_compressor.get_model_context_length", return_value=272000):
-            c = ContextCompressor(model="test", quiet_mode=True)
+        c = ContextCompressor(
+            model="test",
+            quiet_mode=True,
+            config_context_length=272000,
+        )
         cap = c._SUMMARY_INPUT_MAX_CHARS
         c._previous_summary = "PREV_HEAD " + ("p" * (cap * 2)) + " PREV_TAIL"
 
@@ -2503,14 +2506,17 @@ class TestSummaryPromptBounding:
         with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
             summary = c._generate_summary(messages)
 
-        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        prompts = [
+            call.kwargs["messages"][0]["content"]
+            for call in mock_call.call_args_list
+        ]
         assert summary.startswith(SUMMARY_PREFIX)
         # previous summary block + new-turns block each capped, plus the
         # fixed template: well under 3x the cap (unbounded would be ~800K).
-        assert len(prompt) < 2 * cap + 30_000
-        assert "PREV_HEAD" in prompt
-        assert "PREV_TAIL" in prompt
-        assert "summary input truncated" in prompt
+        assert all(len(prompt) < 2 * cap + 30_000 for prompt in prompts)
+        assert "PREV_HEAD" in prompts[0]
+        assert "PREV_TAIL" in prompts[0]
+        assert "summary input truncated" in prompts[0]
 
     def test_marker_does_not_collide_with_summary_classifier(self):
         """The omitted-middle marker must never make bounded content classify
