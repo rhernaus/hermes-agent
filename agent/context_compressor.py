@@ -23,6 +23,7 @@ import sqlite3
 import re
 import time
 import uuid
+from asyncio import CancelledError
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import (
@@ -3438,76 +3439,93 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
     def _split_turns_for_summary(
         self,
         turns: List[Dict[str, Any]],
-    ) -> List[List[Dict[str, Any]]]:
-        """Group whole turns into bounded summarizer passes.
-
-        ``_serialize_for_summary`` already applies the intentional per-message
-        content and tool-argument limits. This splitter prevents the later
-        aggregate bound from dropping the middle of that serialized source.
-        Normal turns stay intact. A pathological single turn that still
-        exceeds the aggregate limit (for example, an assistant message with
-        thousands of tool calls) is represented as ordered assistant-role
-        source fragments so it cannot be mistaken for user-authored input.
-        """
+    ) -> List[str]:
+        """Return bounded, ordered source blocks without omitting serialized rows."""
         limit = self._SUMMARY_INPUT_MAX_CHARS
-        chunks: List[List[Dict[str, Any]]] = []
-        current: List[Dict[str, Any]] = []
-        current_chars = 0
-
-        for turn in turns:
-            rendered = self._serialize_for_summary([turn])
-            parts: List[Dict[str, Any]] = [turn]
-            if len(rendered) > limit:
-                # Keep fragment bodies below the normal per-message body cap so
-                # serializing them again cannot truncate the preserved source.
-                digits = len(str(len(rendered)))
-                header_probe = (
-                    "[Oversized historical turn, part "
-                    f"{'9' * digits}/{'9' * digits}; source material only]\n"
-                )
-                overhead = len(
-                    self._serialize_for_summary(
-                        [{"role": "assistant", "content": header_probe}]
-                    )
-                )
-                payload_chars = max(1, min(self._CONTENT_HEAD, limit - overhead))
-                total_parts = (
-                    len(rendered) + payload_chars - 1
-                ) // payload_chars
-                parts = [
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "[Oversized historical turn, part "
-                            f"{part_index}/{total_parts}; source material only]\n"
-                            + rendered[offset:offset + payload_chars]
-                        ),
-                    }
-                    for part_index, offset in enumerate(
-                        range(0, len(rendered), payload_chars),
-                        start=1,
-                    )
-                ]
-
-            for part in parts:
-                part_chars = len(self._serialize_for_summary([part]))
-                separator_chars = 2 if current else 0
-                if (
-                    current
-                    and current_chars + separator_chars + part_chars > limit
+        rendered_rows = [self._serialize_for_summary([turn]) for turn in turns]
+        source_groups: list[tuple[int, int]] = []
+        index = 0
+        while index < len(turns):
+            turn = turns[index]
+            tool_call_ids = {
+                _extract_tool_call_id(call)
+                for call in (turn.get("tool_calls") or [])
+                if _extract_tool_call_id(call)
+            }
+            group_end = index + 1
+            if turn.get("role") == "assistant" and tool_call_ids:
+                seen_result_ids: set[str] = set()
+                while (
+                    group_end < len(turns)
+                    and turns[group_end].get("role") == "tool"
                 ):
-                    chunks.append(current)
-                    current = []
-                    current_chars = 0
-                    separator_chars = 0
-                current.append(part)
-                current_chars += separator_chars + part_chars
+                    result_id = str(turns[group_end].get("tool_call_id") or "")
+                    if result_id not in tool_call_ids:
+                        break
+                    seen_result_ids.add(result_id)
+                    group_end += 1
+                if seen_result_ids != tool_call_ids:
+                    group_end = index + 1
+            source_groups.append((index, group_end))
+            index = group_end
 
-        if current:
+        chunks: list[str] = []
+        current = ""
+
+        def append_piece(piece: str) -> None:
+            nonlocal current
+            candidate = f"{current}\n\n{piece}" if current else piece
+            if current and len(candidate) > limit:
+                chunks.append(current)
+                current = piece
+            else:
+                current = candidate
+
+        def row_fragments(row: str, role: str) -> list[str]:
+            role_label = (role or "unknown").upper()
+            digits = len(str(max(len(row), 1)))
+            label_probe = (
+                f"[{role_label} FRAGMENT "
+                f"{'9' * digits}/{'9' * digits}]: "
+            )
+            payload_chars = max(1, limit - len(label_probe))
+            total = (len(row) + payload_chars - 1) // payload_chars
+            return [
+                f"[{role_label} FRAGMENT {part}/{total}]: "
+                + row[offset:offset + payload_chars]
+                for part, offset in enumerate(
+                    range(0, len(row), payload_chars),
+                    start=1,
+                )
+            ]
+
+        for start, end in source_groups:
+            rendered_group = "\n\n".join(rendered_rows[start:end])
+            if len(rendered_group) <= limit:
+                append_piece(rendered_group)
+                continue
+
+            # The complete tool group cannot fit. Start it at a clean pass
+            # boundary, then split only at its existing row boundaries (or,
+            # for one pathological row, into directly sliced payload bytes).
+            if current:
+                chunks.append(current)
+                current = ""
+            for row_index in range(start, end):
+                row = rendered_rows[row_index]
+                pieces = (
+                    [row]
+                    if len(row) <= limit
+                    else row_fragments(row, str(turns[row_index].get("role") or "unknown"))
+                )
+                for piece in pieces:
+                    append_piece(piece)
+
+        if current or not chunks:
             chunks.append(current)
         return chunks
 
-    def _generate_summary_in_passes(
+    def _generate_summary(
         self,
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
@@ -3515,11 +3533,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
     ) -> Optional[str]:
         """Summarize every bounded pass, committing only the final result."""
         chunks = self._split_turns_for_summary(turns_to_summarize)
-        telemetry = getattr(self, "_active_compression_telemetry", None)
-        if isinstance(telemetry, dict):
-            telemetry["chunking"] = len(chunks) > 1
-            telemetry["chunk_count"] = len(chunks)
-
+        if len(chunks) > 1:
+            telemetry = getattr(self, "_active_compression_telemetry", None)
+            if isinstance(telemetry, dict):
+                telemetry["chunking"] = True
+                telemetry["chunk_count"] = len(chunks)
         # Match _generate_summary's strict iterative-input boundary before
         # taking the rollback snapshot. A failed later pass must not restore a
         # legacy pre-redaction summary.
@@ -3528,14 +3546,30 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 self._previous_summary
             )
         previous_summary = self._previous_summary
+        summary_budget = self._compute_summary_budget(turns_to_summarize)
+        has_user_turn = getattr(self, "_summary_has_user_turn", None)
+        if has_user_turn is None:
+            has_user_turn = self._transcript_has_real_user_turn(
+                turns_to_summarize
+            )
+        pruned_skill_names = _collect_ghosted_skill_names(turns_to_summarize)
+        for name in _extract_pruned_skill_names(previous_summary or ""):
+            if name not in pruned_skill_names:
+                pruned_skill_names.append(name)
+        del pruned_skill_names[_MAX_PRUNED_SKILL_MARKERS:]
         summary: Optional[str] = None
         committed = False
         try:
-            for chunk in chunks:
-                summary = self._generate_summary(
-                    chunk,
+            for index, chunk in enumerate(chunks):
+                summary = self._generate_summary_pass(
+                    turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
+                    serialized_content=chunk,
+                    summary_budget=summary_budget,
+                    has_user_turn=has_user_turn,
+                    pruned_skill_names=pruned_skill_names,
+                    final_pass=index == len(chunks) - 1,
                 )
                 if not summary:
                     return None
@@ -3579,11 +3613,17 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
-    def _generate_summary(
+    def _generate_summary_pass(
         self,
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
         memory_context: str = "",
+        *,
+        serialized_content: Optional[str] = None,
+        summary_budget: Optional[int] = None,
+        has_user_turn: Optional[bool] = None,
+        pruned_skill_names: Optional[List[str]] = None,
+        final_pass: bool = True,
     ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -3619,8 +3659,13 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         if self._previous_summary:
             self._previous_summary = _redact_compaction_text(self._previous_summary)
 
-        summary_budget = self._compute_summary_budget(turns_to_summarize)
-        content_to_summarize = self._serialize_for_summary(turns_to_summarize)
+        if summary_budget is None:
+            summary_budget = self._compute_summary_budget(turns_to_summarize)
+        content_to_summarize = (
+            serialized_content
+            if serialized_content is not None
+            else self._serialize_for_summary(turns_to_summarize)
+        )
         # P2 ghost-skill defense (#32106): [SKILL_PRUNED: ...] markers entering
         # the summarizer are prompt INPUT only — LLMs routinely paraphrase them
         # into vague prose ("some skills were loaded"), which erases the reload
@@ -3632,10 +3677,15 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         # summary must survive iterative rewrites the same way. Collection
         # walks the turn LIST, so the serialized input bound below cannot
         # hide a marker in its omitted middle.
-        _pruned_skill_names = _collect_ghosted_skill_names(turns_to_summarize)
-        for _name in _extract_pruned_skill_names(self._previous_summary or ""):
-            if _name not in _pruned_skill_names:
-                _pruned_skill_names.append(_name)
+        _pruned_skill_names = (
+            list(pruned_skill_names)
+            if pruned_skill_names is not None
+            else _collect_ghosted_skill_names(turns_to_summarize)
+        )
+        if pruned_skill_names is None:
+            for _name in _extract_pruned_skill_names(self._previous_summary or ""):
+                if _name not in _pruned_skill_names:
+                    _pruned_skill_names.append(_name)
         del _pruned_skill_names[_MAX_PRUNED_SKILL_MARKERS:]
         content_to_summarize = self._bound_summary_input(content_to_summarize)
         _sanitized_memory_context = sanitize_memory_context(memory_context)
@@ -3658,9 +3708,12 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             if _sanitized_memory_context
             else ""
         )
-        has_user_turn = getattr(self, "_summary_has_user_turn", None)
         if has_user_turn is None:
-            has_user_turn = self._transcript_has_real_user_turn(turns_to_summarize)
+            has_user_turn = getattr(self, "_summary_has_user_turn", None)
+            if has_user_turn is None:
+                has_user_turn = self._transcript_has_real_user_turn(
+                    turns_to_summarize
+                )
 
         # Current date for temporal anchoring (see ## Temporal Anchoring below).
         # Date-only granularity matches system_prompt.py:337 (PR #20451) and the
@@ -3980,16 +4033,22 @@ This compaction should PRIORITISE preserving all information related to the focu
             # P2 ghost-skill defense (#32106): deterministically restore any
             # [SKILL_PRUNED: ...] marker the summarizer paraphrased away.
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)
-            summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
-            self._validate_summary_user_provenance(summary, has_user_turn)
+            if final_pass:
+                summary = self._ground_historical_task_snapshot(
+                    summary,
+                    turns_to_summarize,
+                )
+                self._validate_summary_user_provenance(summary, has_user_turn)
             # Store for iterative updates on next compaction
             self._previous_summary = summary
-            self._clear_compression_failure_cooldown()
-            self._summary_model_fallen_back = False
-            self._last_summary_error = None
-            self._last_summary_auth_failure = False
-            self._last_summary_network_failure = False
-            return self._with_summary_prefix(summary)
+            if final_pass:
+                self._clear_compression_failure_cooldown()
+                self._summary_model_fallen_back = False
+                self._last_summary_error = None
+                self._last_summary_auth_failure = False
+                self._last_summary_network_failure = False
+                return self._with_summary_prefix(summary)
+            return summary
         except Exception as e:
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
             #   1. No provider configured ("No LLM provider configured ...") —
@@ -4090,10 +4149,15 @@ This compaction should PRIORITISE preserving all information related to the focu
                 else:
                     _reason = "timed out"
                 self._fallback_to_main_for_compression(e, _reason)
-                return self._generate_summary(
+                return self._generate_summary_pass(
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
+                    serialized_content=serialized_content,
+                    summary_budget=summary_budget,
+                    has_user_turn=has_user_turn,
+                    pruned_skill_names=_pruned_skill_names,
+                    final_pass=final_pass,
                 )  # retry immediately
 
             # Unknown-error best-effort retry on main model.  Losing N turns of
@@ -4111,10 +4175,15 @@ This compaction should PRIORITISE preserving all information related to the focu
                 and not getattr(self, "_summary_model_fallen_back", False)
             ):
                 self._fallback_to_main_for_compression(e, "failed")
-                return self._generate_summary(
+                return self._generate_summary_pass(
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
+                    serialized_content=serialized_content,
+                    summary_budget=summary_budget,
+                    has_user_turn=has_user_turn,
+                    pruned_skill_names=_pruned_skill_names,
+                    final_pass=final_pass,
                 )
 
             # Transient errors (timeout, rate limit, network, JSON decode,
@@ -6430,14 +6499,14 @@ This compaction should PRIORITISE preserving all information related to the focu
             # for it when a summary will actually be generated.
             summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
             try:
-                summary = self._generate_summary_in_passes(
+                summary = self._generate_summary(
                     turns_to_summarize,
                     focus_topic=summary_focus_topic,
                     memory_context=memory_context,
                 )
-            except AuxiliaryExplicitCancellation:
-                # Explicit cancellation is a true no-op. Restore state mutated by
-                # the resume/handoff self-heal scan before the exception escapes to
+            except (AuxiliaryExplicitCancellation, CancelledError):
+                # Cancellation is a true no-op. Restore state mutated by the
+                # resume/handoff self-heal scan before the exception escapes to
                 # the outer transaction, which restores the transcript and lease.
                 self._previous_summary = _previous_summary_before_scan
                 self._summary_has_user_turn = _summary_has_user_turn_before_scan
