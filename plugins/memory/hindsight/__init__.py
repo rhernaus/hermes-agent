@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider, RecallStatus, INDICATOR_GLYPH
+from agent.memory_provider import MemoryProvider, RecallStatus
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
@@ -778,6 +778,9 @@ class HindsightMemoryProvider(MemoryProvider):
         # the agent's status channel, injected via initialize(status_callback=).
         self._retain_indicator = True
         self._status_callback: Optional[Callable[[str], None]] = None
+        self._retain_outcome_admission: Optional[
+            Callable[[str], Callable[[str], bool]]
+        ] = None
         # Single-writer model for retain. sync_turn() enqueues; the writer
         # thread drains sequentially. Avoids spawning ad-hoc threads that
         # can race the interpreter shutdown and emit "cannot schedule new
@@ -1162,7 +1165,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
             {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
-            {"key": "retain_indicator", "description": "Show a '👁️ Hindsight — saving to memory…' status line when a turn is saved to memory (turn off for customer-facing agents)", "default": True},
+            {"key": "retain_indicator", "description": "Show 'Sending to memory…' when a retain starts (turn off for customer-facing agents)", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
@@ -1522,8 +1525,8 @@ class HindsightMemoryProvider(MemoryProvider):
         # user SEES memory working, independent of whether the model mentions it.
         # Off switch for customer-facing agents that shouldn't surface internals.
         self._recall_indicator = bool(self._config.get("recall_indicator", True))
-        # Companion retain indicator: "👁️ Hindsight — saving to memory…" emitted
-        # when a turn is dispatched to the writer. Same off switch rationale.
+        # Companion retain-started indicator emitted when a turn is dispatched
+        # to the writer. Same off switch rationale.
         self._retain_indicator = bool(self._config.get("retain_indicator", True))
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
         self._retain_async = self._config.get("retain_async", True)
@@ -1838,6 +1841,22 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["observation_scopes"] = self._observation_scopes
         return kwargs
 
+    def configure_retain_feedback(
+        self,
+        *,
+        status_callback: Optional[Callable[[str], None]],
+        outcome_admission: Callable[[str], Callable[[str], bool]],
+    ) -> None:
+        """Attach the agent-owned status edge and lifecycle admission seam."""
+        if callable(status_callback):
+            self._status_callback = status_callback
+        self._retain_outcome_admission = outcome_admission
+
+    def _admit_retain_terminal(self, session_id: str) -> Callable[[str], bool]:
+        if self._retain_outcome_admission is None:
+            return lambda _outcome: False
+        return self._retain_outcome_admission(session_id)
+
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Enqueue a retain for the current turn. Non-blocking.
 
@@ -1901,6 +1920,7 @@ class HindsightMemoryProvider(MemoryProvider):
         bank_id = self._bank_id
         retain_async_flag = self._retain_async
         retain_context = self._retain_context
+        outcome_admission = self._admit_retain_terminal(self._session_id)
 
         def _do_retain() -> None:
             item = self._build_retain_kwargs(
@@ -1915,30 +1935,39 @@ class HindsightMemoryProvider(MemoryProvider):
                 item["update_mode"] = update_mode
             logger.debug("Hindsight retain: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
                          bank_id, document_id, update_mode, retain_async_flag, len(content), num_turns)
-            self._run_hindsight_operation(
-                lambda client: client.aretain_batch(
-                    bank_id=bank_id,
-                    items=[item],
-                    document_id=document_id,
-                    retain_async=retain_async_flag,
+            try:
+                self._run_hindsight_operation(
+                    lambda client: client.aretain_batch(
+                        bank_id=bank_id,
+                        items=[item],
+                        document_id=document_id,
+                        retain_async=retain_async_flag,
+                    )
                 )
+            except Exception:
+                outcome_admission("Conversation could not be saved to memory.")
+                raise
+            outcome_admission(
+                "Conversation accepted by the memory server for processing."
+                if retain_async_flag
+                else "Conversation saved to memory."
             )
             logger.debug("Hindsight retain succeeded")
 
         self._ensure_writer()
         self._register_atexit()
-        # Deterministic "saving to memory" indicator — emitted the moment a
+        self._retain_queue.put(_do_retain)
+        # Deterministic retain-started indicator — emitted the moment a
         # real retain is dispatched (past every skip/buffer gate above), so it
         # only fires on turns that actually persist.
         self._emit_saving_indicator()
-        self._retain_queue.put(_do_retain)
         # Advance the append watermark only after the delta is queued, so a
         # later retain doesn't re-ship turns we've already handed to the writer.
         if update_mode == "append":
             self._last_retained_turn_count = len(self._session_turns)
 
     def _emit_saving_indicator(self) -> None:
-        """Surface a model-independent "saving to memory" status line.
+        """Surface a model-independent retain-started status line.
 
         Runs on the background sync worker (sync_turn's caller). No-ops when the
         indicator is turned off (``retain_indicator=false``) or no status
@@ -1948,7 +1977,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if not self._retain_indicator or self._status_callback is None:
             return
         try:
-            self._status_callback(f"{INDICATOR_GLYPH} Hindsight — saving to memory…")
+            self._status_callback("Sending to memory…")
         except Exception:
             logger.debug("Retain indicator emit failed (non-fatal)", exc_info=True)
 
@@ -2098,6 +2127,8 @@ class HindsightMemoryProvider(MemoryProvider):
             old_document_id, old_update_mode = self._resolve_retain_target(
                 self._document_id
             )
+            old_retain_async = self._retain_async
+            outcome_admission = self._admit_retain_terminal(new_id)
 
             def _flush():
                 try:
@@ -2120,11 +2151,18 @@ class HindsightMemoryProvider(MemoryProvider):
                             bank_id=self._bank_id,
                             items=[item],
                             document_id=old_document_id,
-                            retain_async=self._retain_async,
+                            retain_async=old_retain_async,
                         )
                     )
                 except Exception as e:
+                    outcome_admission("Conversation could not be saved to memory.")
                     logger.warning("Hindsight flush-on-switch failed: %s", e, exc_info=True)
+                else:
+                    outcome_admission(
+                        "Conversation accepted by the memory server for processing."
+                        if old_retain_async
+                        else "Conversation saved to memory."
+                    )
 
             # Route the flush through the same writer queue sync_turn
             # uses. That serializes it behind any still-queued retains
@@ -2136,6 +2174,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._ensure_writer()
                 self._register_atexit()
                 self._retain_queue.put(_flush)
+                self._emit_saving_indicator()
 
         # 2. Drain any in-flight prefetch from the old session and drop
         # its cached result so the new session doesn't see stale recall.

@@ -31,7 +31,7 @@ import re
 import inspect
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
@@ -45,6 +45,167 @@ logger = logging.getLogger(__name__)
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+
+
+class _RetainOutcomeOwner:
+    """One live conversation lineage, independent of cached agent objects."""
+
+    __slots__ = ("coordinates", "outcomes", "forwarded_to", "live")
+
+    def __init__(self, coordinates: Tuple[str, str]) -> None:
+        self.coordinates = coordinates
+        self.outcomes: List[str] = []
+        self.forwarded_to: Optional["_RetainOutcomeOwner"] = None
+        self.live = True
+
+
+class _RetainOutcomeAdmission:
+    """Capability captured before a provider starts an asynchronous write."""
+
+    __slots__ = ("_owner", "_used")
+
+    def __init__(self, owner: Optional[_RetainOutcomeOwner]) -> None:
+        self._owner = owner
+        self._used = False
+
+    def __call__(self, outcome: str) -> bool:
+        with _RETAIN_OUTCOME_LOCK:
+            if self._used:
+                return False
+            self._used = True
+            owner = _retain_outcome_root(self._owner)
+            if owner is None or not owner.live:
+                return False
+            if _RETAIN_OUTCOME_OWNERS.get(owner.coordinates) is not owner:
+                return False
+            owner.outcomes.append(outcome)
+            return True
+
+
+_RETAIN_OUTCOME_LOCK = threading.Lock()
+_RETAIN_OUTCOME_OWNERS: Dict[Tuple[str, str], _RetainOutcomeOwner] = {}
+
+
+def _retain_outcome_coordinates(
+    gateway_session_key: str, session_id: str
+) -> Tuple[str, str]:
+    return (gateway_session_key or "", session_id or "")
+
+
+def _retain_outcome_root(
+    owner: Optional[_RetainOutcomeOwner],
+) -> Optional[_RetainOutcomeOwner]:
+    path: List[_RetainOutcomeOwner] = []
+    while owner is not None and owner.forwarded_to is not None:
+        path.append(owner)
+        owner = owner.forwarded_to
+    for displaced in path:
+        displaced.forwarded_to = owner
+    return owner
+
+
+def _bind_retain_outcome_owner(gateway_session_key: str, session_id: str) -> None:
+    """Bind a provider-bearing manager's authoritative live identity."""
+    coordinates = _retain_outcome_coordinates(gateway_session_key, session_id)
+    if not coordinates[1]:
+        return
+    with _RETAIN_OUTCOME_LOCK:
+        _RETAIN_OUTCOME_OWNERS.setdefault(
+            coordinates, _RetainOutcomeOwner(coordinates)
+        )
+
+
+def _admit_retain_outcome(
+    gateway_session_key: str, session_id: str
+) -> Callable[[str], bool]:
+    """Capture one terminal-outcome capability, or a rejecting capability."""
+    coordinates = _retain_outcome_coordinates(gateway_session_key, session_id)
+    with _RETAIN_OUTCOME_LOCK:
+        owner = _retain_outcome_root(_RETAIN_OUTCOME_OWNERS.get(coordinates))
+        if owner is None or not owner.live:
+            owner = None
+        return _RetainOutcomeAdmission(owner)
+
+
+def _drain_retain_outcomes(gateway_session_key: str, session_id: str) -> Tuple[str, ...]:
+    """Atomically detach every pending outcome in FIFO order."""
+    coordinates = _retain_outcome_coordinates(gateway_session_key, session_id)
+    with _RETAIN_OUTCOME_LOCK:
+        owner = _retain_outcome_root(_RETAIN_OUTCOME_OWNERS.get(coordinates))
+        if owner is None or not owner.live or not owner.outcomes:
+            return ()
+        outcomes = tuple(owner.outcomes)
+        owner.outcomes.clear()
+        return outcomes
+
+
+def _move_retain_outcome_owner(
+    gateway_session_key: str,
+    source_session_id: str,
+    destination_session_id: str,
+    *,
+    destination_gateway_session_key: Optional[str] = None,
+) -> None:
+    """Move continuity, merging source FIFO before destination FIFO on collision."""
+    source_coordinates = _retain_outcome_coordinates(
+        gateway_session_key, source_session_id
+    )
+    destination_coordinates = _retain_outcome_coordinates(
+        gateway_session_key
+        if destination_gateway_session_key is None
+        else destination_gateway_session_key,
+        destination_session_id,
+    )
+    if not source_coordinates[1] or not destination_coordinates[1]:
+        return
+    if source_coordinates == destination_coordinates:
+        return
+
+    with _RETAIN_OUTCOME_LOCK:
+        source = _retain_outcome_root(_RETAIN_OUTCOME_OWNERS.get(source_coordinates))
+        if source is None or not source.live:
+            return
+        destination = _retain_outcome_root(
+            _RETAIN_OUTCOME_OWNERS.get(destination_coordinates)
+        )
+        _RETAIN_OUTCOME_OWNERS.pop(source_coordinates, None)
+
+        if destination is source:
+            source.coordinates = destination_coordinates
+            _RETAIN_OUTCOME_OWNERS[destination_coordinates] = source
+            return
+
+        if destination is not None and destination.live:
+            _RETAIN_OUTCOME_OWNERS.pop(destination_coordinates, None)
+            source.outcomes.extend(destination.outcomes)
+            destination.outcomes.clear()
+            destination.forwarded_to = source
+
+        source.coordinates = destination_coordinates
+        _RETAIN_OUTCOME_OWNERS[destination_coordinates] = source
+
+
+def _abandon_retain_outcome_owner(gateway_session_key: str, session_id: str) -> None:
+    """Fence an owner synchronously and abandon all undelivered outcomes."""
+    coordinates = _retain_outcome_coordinates(gateway_session_key, session_id)
+    with _RETAIN_OUTCOME_LOCK:
+        owner = _retain_outcome_root(_RETAIN_OUTCOME_OWNERS.pop(coordinates, None))
+        if owner is None:
+            return
+        _RETAIN_OUTCOME_OWNERS.pop(owner.coordinates, None)
+        owner.live = False
+        owner.outcomes.clear()
+
+
+def _abandon_all_retain_outcome_owners() -> None:
+    """Fence all live owners during full gateway/process shutdown."""
+    with _RETAIN_OUTCOME_LOCK:
+        roots = {_retain_outcome_root(owner) for owner in _RETAIN_OUTCOME_OWNERS.values()}
+        _RETAIN_OUTCOME_OWNERS.clear()
+        for owner in roots:
+            if owner is not None:
+                owner.live = False
+                owner.outcomes.clear()
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
@@ -398,6 +559,37 @@ class MemoryManager:
             "abandoned_prefetches": 0,
             "active_tasks": 0,
         }
+        self._retain_gateway_session_key = ""
+        self._retain_session_id = ""
+
+    def bind_retain_feedback(
+        self,
+        gateway_session_key: str,
+        session_id: str,
+        status_callback: Optional[Callable[[str], None]],
+    ) -> None:
+        """Bind construction-time lifecycle feedback without owning its cache."""
+        if not self._providers or not session_id:
+            return
+        self._retain_gateway_session_key = gateway_session_key or ""
+        self._retain_session_id = session_id
+        _bind_retain_outcome_owner(self._retain_gateway_session_key, session_id)
+        for provider in self._providers:
+            configure = getattr(provider, "configure_retain_feedback", None)
+            if callable(configure):
+                configure(
+                    status_callback=status_callback,
+                    outcome_admission=lambda owner_session_id: _admit_retain_outcome(
+                        self._retain_gateway_session_key,
+                        owner_session_id,
+                    ),
+                )
+
+    def drain_retain_feedback(self, session_id: str) -> Tuple[str, ...]:
+        return _drain_retain_outcomes(self._retain_gateway_session_key, session_id)
+
+    def abandon_retain_feedback(self, session_id: str) -> None:
+        _abandon_retain_outcome_owner(self._retain_gateway_session_key, session_id)
 
     # -- Registration --------------------------------------------------------
 
@@ -936,6 +1128,10 @@ class MemoryManager:
         """
         if not self._providers:
             return
+        if self._retain_session_id:
+            _abandon_retain_outcome_owner(
+                self._retain_gateway_session_key, self._retain_session_id
+            )
         snapshot = list(messages or [])
 
         def _run() -> None:
@@ -981,6 +1177,23 @@ class MemoryManager:
         """
         if not new_session_id:
             return
+        old_session_id = self._retain_session_id
+        if old_session_id != new_session_id:
+            if old_session_id and reset:
+                _abandon_retain_outcome_owner(
+                    self._retain_gateway_session_key, old_session_id
+                )
+                if self._providers:
+                    _bind_retain_outcome_owner(
+                        self._retain_gateway_session_key, new_session_id
+                    )
+            elif old_session_id:
+                _move_retain_outcome_owner(
+                    self._retain_gateway_session_key,
+                    old_session_id,
+                    new_session_id,
+                )
+            self._retain_session_id = new_session_id
         # Only forward ``rewound`` when it's actually set. Passing it
         # unconditionally would inject ``rewound=False`` into every
         # provider's **kwargs for the common /resume, /branch, /new, and

@@ -720,20 +720,20 @@ class TestSyncTurn:
 
 
 # ---------------------------------------------------------------------------
-# retain indicator ("saving to memory") tests
+# retain-started indicator tests
 # ---------------------------------------------------------------------------
 
 
 class TestRetainIndicator:
-    _SAVING = "👁️ Hindsight — saving to memory…"
+    _STARTED = "Sending to memory…"
 
-    def test_emits_saving_on_dispatch(self, provider_with_config):
+    def test_emits_started_on_dispatch(self, provider_with_config):
         calls = []
         p = provider_with_config(retain_async=False)
         p._status_callback = calls.append
         p.sync_turn("hello", "hi")
         p._retain_queue.join()
-        assert self._SAVING in calls
+        assert self._STARTED in calls
 
     def test_suppressed_when_indicator_off(self, provider_with_config):
         calls = []
@@ -752,7 +752,7 @@ class TestRetainIndicator:
 
     def test_no_emit_on_buffered_turn(self, provider_with_config):
         # retain_every_n_turns=2: turn 1 buffers (no write, no line),
-        # turn 2 flushes (one line) — "saving" only fires on a real write.
+        # turn 2 flushes (one line) — "started" only fires on a real write.
         calls = []
         p = provider_with_config(retain_every_n_turns=2, retain_async=False)
         p._status_callback = calls.append
@@ -760,7 +760,7 @@ class TestRetainIndicator:
         assert calls == []
         p.sync_turn("t2-u", "t2-a")
         p._retain_queue.join()
-        assert calls == [self._SAVING]
+        assert calls == [self._STARTED]
 
     def test_no_crash_without_callback(self, provider_with_config):
         p = provider_with_config(retain_async=False)

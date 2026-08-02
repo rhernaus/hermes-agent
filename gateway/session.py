@@ -20,6 +20,11 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Any
 
+from agent.memory_manager import (
+    _abandon_retain_outcome_owner,
+    _move_retain_outcome_owner,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -1397,6 +1402,11 @@ class SessionStore:
                             row["end_reason"],
                             recovered_entry.session_id,
                         )
+                        _move_retain_outcome_owner(
+                            key,
+                            entry.session_id,
+                            recovered_entry.session_id,
+                        )
                         self._entries[key] = recovered_entry
                         recovered_keys += 1
                         continue
@@ -1415,6 +1425,7 @@ class SessionStore:
             return
 
         for key in stale_keys:
+            _abandon_retain_outcome_owner(key, self._entries[key].session_id)
             del self._entries[key]
 
         if stale_keys or recovered_keys:
@@ -2105,6 +2116,11 @@ class SessionStore:
             entry.session_id,
             canonical_session_id,
         )
+        _move_retain_outcome_owner(
+            entry.session_key,
+            original_session_id,
+            canonical_session_id,
+        )
         entry.session_id = canonical_session_id
         return True
 
@@ -2222,6 +2238,12 @@ class SessionStore:
                         adopt = source.chat_type == "dm"
                     if adopt and self._claim_legacy_slack_key(legacy_key):
                         migrated_legacy_entry = self._entries.pop(legacy_key)
+                        _move_retain_outcome_owner(
+                            legacy_key,
+                            migrated_legacy_entry.session_id,
+                            migrated_legacy_entry.session_id,
+                            destination_gateway_session_key=session_key,
+                        )
                         migrated_legacy_entry.session_key = session_key
                         migrated_legacy_entry.origin = source
                         migrated_legacy_entry.platform = source.platform
@@ -2341,6 +2363,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        _abandon_retain_outcome_owner(session_key, entry.session_id)
                     entry = None
                     _needs_recover = True
                 elif entry.session_id != _stale_session_id:
@@ -2356,6 +2379,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        _abandon_retain_outcome_owner(session_key, entry.session_id)
                         self._entries.pop(session_key, None)
                         entry = None
                         _needs_recover = True
@@ -2379,6 +2403,12 @@ class SessionStore:
                 with self._lock:
                     published = self._entries.get(session_key)
                     if published is None:
+                        if _stale_session_id:
+                            _move_retain_outcome_owner(
+                                session_key,
+                                _stale_session_id,
+                                recovered.session_id,
+                            )
                         self._entries[session_key] = recovered
                         published = recovered
                 entry = published
@@ -2408,6 +2438,15 @@ class SessionStore:
                     force_new and current is force_new_observed_entry
                 )
                 if may_publish:
+                    replaced_session_id = (
+                        force_new_observed_entry.session_id
+                        if force_new and force_new_observed_entry is not None
+                        else _stale_session_id
+                    )
+                    if replaced_session_id:
+                        _abandon_retain_outcome_owner(
+                            session_key, replaced_session_id
+                        )
                     self._entries[session_key] = candidate
                     published = candidate
                 else:
@@ -2639,7 +2678,7 @@ class SessionStore:
         from datetime import timedelta
 
         cutoff = _now() - timedelta(days=max_age_days)
-        removed_keys: list[str] = []
+        removed_keys: list[tuple[str, str]] = []
 
         with self._lock:
             self._ensure_loaded_locked()
@@ -2654,8 +2693,9 @@ class SessionStore:
                 if self._has_active_processes_safe(entry.session_key, context="prune"):
                     continue
                 if entry.updated_at < cutoff:
-                    removed_keys.append(key)
-            for key in removed_keys:
+                    removed_keys.append((key, entry.session_id))
+            for key, session_id in removed_keys:
+                _abandon_retain_outcome_owner(key, session_id)
                 self._entries.pop(key, None)
             if removed_keys:
                 self._save()
@@ -2717,6 +2757,7 @@ class SessionStore:
 
             old_entry = self._entries[session_key]
             db_end_session_id = old_entry.session_id
+            _abandon_retain_outcome_owner(session_key, old_entry.session_id)
 
             now = _now()
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -2835,6 +2876,11 @@ class SessionStore:
                 return old_entry
 
             db_end_session_id = old_entry.session_id
+            _move_retain_outcome_owner(
+                session_key,
+                old_entry.session_id,
+                target_session_id,
+            )
 
             now = _now()
             new_entry = SessionEntry(

@@ -1151,6 +1151,18 @@ def build_turn_context(
         except Exception:
             pass
 
+        try:
+            _retain_outcomes = agent._memory_manager.drain_retain_feedback(
+                agent.session_id or ""
+            )
+        except Exception:
+            _retain_outcomes = ()
+        for _retain_outcome in _retain_outcomes:
+            try:
+                agent._emit_status(_retain_outcome)
+            except Exception:
+                pass
+
     # External memory provider: prefetch once before the tool loop.
     ext_prefetch_cache = ""
     if agent._memory_manager:

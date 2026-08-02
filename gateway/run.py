@@ -5186,6 +5186,13 @@ class TurnRunner:
                         entry_session_id,
                     )
                 else:
+                    from agent.memory_manager import _move_retain_outcome_owner
+
+                    _move_retain_outcome_owner(
+                        ctx.session_key,
+                        ctx.session_id,
+                        agent_session_id,
+                    )
                     entry.session_id = agent_session_id
                     self._runner.session_store._save()
                     self._runner.session_store._record_gateway_session_peer(
@@ -11391,6 +11398,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise RuntimeError(
                 f"could not switch session key {session_key} → {cli_session_id}"
             )
+        from agent.memory_manager import _move_retain_outcome_owner
+
+        _move_retain_outcome_owner(
+            "",
+            cli_session_id,
+            cli_session_id,
+            destination_gateway_session_key=session_key,
+        )
 
         # Evict any cached AIAgent for this session_key so the next dispatch
         # rebuilds it against the CLI session_id (mirrors /resume / /branch).
@@ -11494,6 +11509,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 for key, entry in _expired_entries:
                     try:
+                        from agent.memory_manager import _abandon_retain_outcome_owner
+
+                        _abandon_retain_outcome_owner(key, entry.session_id)
                         try:
                             from hermes_cli.lifecycle import finalize_session
                             _parts = key.split(":")
@@ -12079,6 +12097,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+            from agent.memory_manager import _abandon_all_retain_outcome_owners
+
+            _abandon_all_retain_outcome_owners()
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
@@ -16826,6 +16847,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
                 if session_entry.session_id == _run_start_session_id:
+                    from agent.memory_manager import _move_retain_outcome_owner
+
+                    _move_retain_outcome_owner(
+                        session_key,
+                        session_entry.session_id,
+                        agent_result["session_id"],
+                    )
                     session_entry.session_id = agent_result["session_id"]
                     # The held turn lease follows the rotation: the transcript
                     # persistence below writes to the NEW id, so the
