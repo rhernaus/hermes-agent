@@ -708,7 +708,18 @@ def compact_fallback_turn(value):
     limit = cc._FALLBACK_TURN_MAX_CHARS
     if len(text) > limit:
         text = text[:limit - 15].rstrip() + ' ...[truncated]'
-    return re.sub(r'\bgh[pousr]_[A-Za-z0-9_.-]+', '[REDACTED]', text)
+    text = re.sub(r'\bgh[pousr]_[A-Za-z0-9_.-]+', '[REDACTED]', text)
+    # The task anchor passes through TWO independent reductions, not one. The
+    # shared per-turn helper bounds a turn at _FALLBACK_TURN_MAX_CHARS above;
+    # the fallback builder then applies a second, separately-constanted
+    # head/tail reduction to the same text before it reaches ``user_asks``.
+    # Both stages must be mirrored here: the first alone yields a longer
+    # string that the published anchor never contains. Only the
+    # ``## Last Dropped Turns`` rendering keeps the first-stage form, which is
+    # why the two anchors are not interchangeable.
+    if len(text) > 600:
+        text = text[:420].rstrip() + ' ... ' + text[-160:].lstrip()
+    return text
 
 
 def observed_window(prompts, markers):
