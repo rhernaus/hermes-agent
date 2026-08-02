@@ -45,11 +45,22 @@ index = 2
 kind = "owned-followup"
 title = "generic gateway retain feedback on top of PR 74379"
 spec = "FOLLOWUP.md"
-materialization = "pending-phase-3"
-retention_tag = "pending-phase-3"
-head_sha = "pending-phase-3"
-head_tree = "pending-phase-3"
-patch_base = "pending-phase-3"
-changed_paths = []
+retention_tag = "followup/gateway-retain-feedback-5961fbfc6482cee5a08d8ffdf901db57a64c2ae6"
+head_sha = "5961fbfc6482cee5a08d8ffdf901db57a64c2ae6"
+head_tree = "69d9e6506929c4e733ee1c5c1276d3bc3a19ad45"
+patch_base = "a0beb2b844df9984f6704d254a02b46b66223112"
+changed_paths = [
+  "agent/conversation_compression.py",
+  "agent/memory_manager.py",
+  "agent/turn_context.py",
+  "gateway/run.py",
+  "gateway/session.py",
+  "plugins/memory/hindsight/README.md",
+  "plugins/memory/hindsight/__init__.py",
+  "run_agent.py",
+  "tests/agent/test_memory_retain_status_gateway_seam.py",
+  "tests/agent/test_memory_session_switch.py",
+  "tests/plugins/memory/test_hindsight_provider.py",
+]
 depends_on = [1]
 order_rationale = "modifies call sites introduced by entry 1"
