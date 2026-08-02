@@ -587,6 +587,12 @@ class AIAgent:
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
         )
+        if self._memory_manager:
+            self._memory_manager.bind_retain_feedback(
+                getattr(self, "_gateway_session_key", "") or "",
+                self.session_id or "",
+                self._emit_status,
+            )
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
@@ -3834,6 +3840,8 @@ class AIAgent:
         session expiry, etc.
         """
         if self._memory_manager:
+            if getattr(self, "_end_session_on_close", True):
+                self._memory_manager.abandon_retain_feedback(self.session_id or "")
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception as e:

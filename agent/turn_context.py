@@ -1151,6 +1151,18 @@ def build_turn_context(
         except Exception:
             pass
 
+        try:
+            _retain_outcomes = agent._memory_manager.drain_retain_feedback(
+                agent.session_id or ""
+            )
+        except Exception:
+            _retain_outcomes = ()
+        for _retain_outcome in _retain_outcomes:
+            try:
+                agent._emit_status(_retain_outcome)
+            except Exception:
+                pass
+
     # External memory provider: prefetch once before the tool loop.
     ext_prefetch_cache = ""
     if agent._memory_manager:
@@ -1159,6 +1171,17 @@ def build_turn_context(
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
             pass
+        # Deterministic, model-independent recall indicator: when memory was
+        # actually injected this turn, tell the user — don't rely on the model
+        # to surface it. Rendered by Hermes (via _emit_status), so it always
+        # shows and can't be silently dropped by the model.
+        if ext_prefetch_cache:
+            try:
+                _recall_indicator = agent._memory_manager.describe_recall()
+                if _recall_indicator:
+                    agent._emit_status(_recall_indicator)
+            except Exception:
+                pass
 
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this

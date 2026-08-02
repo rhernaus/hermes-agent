@@ -420,6 +420,13 @@ def _adopt_live_compression_child(
     if not confirmed or str(confirmed.get("id") or "") != child_session_id:
         return None
 
+    from agent.memory_manager import _move_retain_outcome_owner
+
+    _move_retain_outcome_owner(
+        getattr(agent, "_gateway_session_key", "") or "",
+        parent_session_id,
+        child_session_id,
+    )
     agent.session_id = child_session_id
     try:
         from gateway.session_context import set_current_session_id
@@ -2147,20 +2154,38 @@ def compress_context(
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
                         f"{uuid.uuid4().hex[:6]}"
                     )
-                    agent._session_db.publish_compression_child(
-                        parent_session_id=old_session_id,
-                        child_session_id=new_session_id,
-                        source=agent.platform
-                        or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
-                        model=agent.model,
-                        model_config=agent._session_init_model_config,
-                        system_prompt=new_system_prompt,
-                        messages=compressed,
-                        cwd=getattr(agent, "working_directory", None),
-                        profile_name=_profile_for_child,
-                        compression_lock_holder=_lock_holder,
-                        require_compression_lease=_lock_holder is not None,
+                    from agent.memory_manager import _move_retain_outcome_owner
+
+                    _gateway_session_key = (
+                        getattr(agent, "_gateway_session_key", "") or ""
                     )
+                    _move_retain_outcome_owner(
+                        _gateway_session_key,
+                        old_session_id,
+                        new_session_id,
+                    )
+                    try:
+                        agent._session_db.publish_compression_child(
+                            parent_session_id=old_session_id,
+                            child_session_id=new_session_id,
+                            source=agent.platform
+                            or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                            model=agent.model,
+                            model_config=agent._session_init_model_config,
+                            system_prompt=new_system_prompt,
+                            messages=compressed,
+                            cwd=getattr(agent, "working_directory", None),
+                            profile_name=_profile_for_child,
+                            compression_lock_holder=_lock_holder,
+                            require_compression_lease=_lock_holder is not None,
+                        )
+                    except Exception:
+                        _move_retain_outcome_owner(
+                            _gateway_session_key,
+                            new_session_id,
+                            old_session_id,
+                        )
+                        raise
                     agent.session_id = new_session_id
                     try:
                         from gateway.session_context import set_current_session_id
