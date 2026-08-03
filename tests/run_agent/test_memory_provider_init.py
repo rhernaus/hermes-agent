@@ -1,5 +1,7 @@
 """Regression tests for memory provider selection during AIAgent init."""
 
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,6 +25,20 @@ class RecordingMemoryProvider:
 
     def shutdown(self):
         pass
+
+
+class BlockingMemoryProvider(RecordingMemoryProvider):
+    """External provider that exposes the manager's configured timeout."""
+
+    def __init__(self):
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def prefetch(self, query, *, session_id=""):
+        self.started.set()
+        self.release.wait(timeout=0.2)
+        return "late memory"
 
 
 def test_blank_memory_provider_does_not_auto_enable_honcho():
@@ -92,6 +108,50 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert provider.init_kwargs["platform"] == "feishu"
     assert "warning_callback" not in provider.init_kwargs
     assert "status_callback" not in provider.init_kwargs
+
+
+def test_aiagent_applies_external_memory_prefetch_timeout():
+    provider = BlockingMemoryProvider()
+    cfg = {
+        "memory": {
+            "provider": "recording",
+            "external_prefetch_timeout": 0.01,
+        },
+        "agent": {},
+    }
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+        )
+
+    manager = getattr(agent, "_memory_manager", None)
+    assert manager is not None
+
+    started = time.monotonic()
+    try:
+        result = manager.prefetch_all("current query")
+    finally:
+        provider.release.set()
+    elapsed = time.monotonic() - started
+
+    assert provider.started.is_set()
+    assert result == ""
+    assert elapsed < 0.1
 
 
 class CoreShadowProvider:

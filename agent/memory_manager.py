@@ -368,6 +368,17 @@ class MemoryManager:
     provider is allowed.  Failures in one provider never block the other.
     """
 
+    @classmethod
+    def from_config(cls, config: Optional[Dict[str, Any]] = None) -> "MemoryManager":
+        """Build a manager from the ``memory`` config section.
+
+        The default remains intentionally short so a wedged external provider
+        cannot hold every turn. Deployments that opt into synchronous recall
+        can raise the bound explicitly to match their observed provider latency.
+        """
+        timeout = config.get("external_prefetch_timeout") if config else None
+        return cls(external_prefetch_timeout=timeout)
+
     def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}

@@ -78,6 +78,12 @@ Config file: `~/.hermes/hindsight/config.json`
 | `recall_types` | `observation` | Fact types surfaced by recall (both auto-recall and the `hindsight_recall` tool). Comma-separated string or JSON list. **Default narrowed to `observation` only** (see "Behavior change" below). Set to `observation,world,experience` to also include raw facts. |
 | `auto_recall` | `true` | Automatically recall memories before each turn |
 
+Synchronous recall is still bounded by Hermes' external-provider safety timeout.
+If live Hindsight recalls take longer than the default 8 seconds, set
+`memory.external_prefetch_timeout` in `config.yaml` to a measured, bounded value
+(for example `15`) so current-query context is not discarded while the provider
+finishes.
+
 > **Behavior change — `recall_types` defaults to `observation` only.**
 >
 > Previously recall returned all three fact types. It now returns only observations.

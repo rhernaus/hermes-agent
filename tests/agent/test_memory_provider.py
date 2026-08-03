@@ -145,6 +145,18 @@ class TestMemoryProviderABC:
 
 
 class TestMemoryManager:
+    def test_from_config_preserves_default_external_prefetch_timeout(self):
+        mgr = MemoryManager.from_config({"provider": "hindsight"})
+
+        assert mgr._external_prefetch_timeout == 8.0
+
+    def test_from_config_applies_external_prefetch_timeout(self):
+        mgr = MemoryManager.from_config(
+            {"provider": "hindsight", "external_prefetch_timeout": 15}
+        )
+
+        assert mgr._external_prefetch_timeout == 15.0
+
     def test_empty_manager(self):
         mgr = MemoryManager()
         assert mgr.providers == []

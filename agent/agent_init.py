@@ -1673,6 +1673,7 @@ def init_agent(
     # the memory tool dispatches with store=None and every call fails (#65429).
     # So the built-in store is created unless memory is globally disabled, while
     # the external-provider block below stays gated on skip_memory.
+    mem_config = {}
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
     if not skip_memory or _memory_toolset_requested:
         try:
@@ -1702,7 +1703,7 @@ def init_agent(
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager.from_config(mem_config)
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
