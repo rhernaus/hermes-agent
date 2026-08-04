@@ -362,6 +362,16 @@ printf '1000\\n'
 """,
         )
         cls._write_executable(
+            cls.fake_bin / "stat",
+            """#!/bin/sh
+if [ "$#" -eq 3 ] && [ "$1" = -c ] && [ "$2" = %u ] && [ "$3" = "$FAKE_TASK_ROOT" ]; then
+    printf '1000\n'
+    exit 0
+fi
+exec /usr/bin/stat "$@"
+""",
+        )
+        cls._write_executable(
             cls.fake_bin / "podman",
             """#!/bin/sh
 printf '%s\\n' "$*" >>"$FAKE_PODMAN_LOG"
@@ -510,6 +520,7 @@ esac
             "PATH": f"{self.fake_bin}:{os.environ['PATH']}",
             "FAKE_PODMAN_ROWS": str(self.podman_rows),
             "FAKE_PODMAN_LOG": str(self.podman_log),
+            "FAKE_TASK_ROOT": str(self.task_root),
         }
         return subprocess.run(
             [str(self.helper), *arguments],
