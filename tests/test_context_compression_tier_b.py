@@ -782,8 +782,8 @@ esac
             "OPENAI_API_KEY", " ".join(value for run in runs for value in run)
         )
         self.assertTrue((self.task_root / "prepare-venv").is_dir())
-        ignorefile = self.task_root / "runtime/.tier-b-empty.containerignore"
-        self.assertEqual(ignorefile.read_bytes(), b"")
+        ignorefile = self.task_root / "runtime/.tier-b-allow-all.containerignore"
+        self.assertEqual(ignorefile.read_bytes(), b"!**\n")
         self.assertEqual(stat.S_IMODE(ignorefile.stat().st_mode), 0o400)
         self.assertEqual(
             (
