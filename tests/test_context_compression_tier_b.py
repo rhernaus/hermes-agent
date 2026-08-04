@@ -354,15 +354,6 @@ class RuntimeHelperSourceStagingContractTests(unittest.TestCase):
         cls.podman_rows = cls.root / "podman-rows"
         cls.podman_log = cls.root / "podman.log"
 
-        helper_source = REPO_ROOT / "evaluation/context_compression_tier_b_runtime.sh"
-        helper_bytes = helper_source.read_bytes().replace(
-            b"ROOT=/home/ron/hermes-compaction-tier-b",
-            f"ROOT={cls.task_root}".encode(),
-        )
-        cls.helper = cls.root / "context_compression_tier_b_runtime.sh"
-        cls.helper.write_bytes(helper_bytes)
-        cls.helper.chmod(0o700)
-
         cls._write_executable(
             cls.fake_bin / "id",
             """#!/bin/sh
@@ -384,35 +375,75 @@ esac
         )
 
         source = cls.root / "bundle-source"
-        cloned = subprocess.run(
+        environment = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Tier B test",
+            "GIT_AUTHOR_EMAIL": "tier-b-test@example.invalid",
+            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+0000",
+            "GIT_COMMITTER_NAME": "Tier B test",
+            "GIT_COMMITTER_EMAIL": "tier-b-test@example.invalid",
+            "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+0000",
+        }
+
+        def run_git(*arguments):
+            completed = subprocess.run(
+                ["git", "-C", str(source), *arguments],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            if completed.returncode:
+                raise AssertionError(completed.stderr)
+
+        initialized = subprocess.run(
             [
                 "git",
-                "clone",
+                "init",
                 "--quiet",
-                "--no-hardlinks",
-                str(REPO_ROOT),
+                "--initial-branch=eval/compaction-tier-a",
                 str(source),
             ],
             capture_output=True,
             text=True,
+            env=environment,
         )
-        if cloned.returncode:
-            raise AssertionError(cloned.stderr)
-        branched = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(source),
-                "checkout",
-                "--quiet",
-                "-B",
-                "eval/compaction-tier-a",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if branched.returncode:
-            raise AssertionError(branched.stderr)
+        if initialized.returncode:
+            raise AssertionError(initialized.stderr)
+        history = source / ".tier-b-test-history"
+
+        def commit_history(message, content):
+            history.write_text(content, encoding="utf-8")
+            run_git("add", "--", history.name)
+            run_git("-c", "commit.gpgsign=false", "commit", "--quiet", "-m", message)
+            return subprocess.check_output(
+                ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+            ).strip()
+
+        starting_head = commit_history("starting", "starting\n")
+        baseline_sha = commit_history("baseline", "starting\nbaseline\n")
+        candidate_sha = commit_history("candidate", "starting\nbaseline\ncandidate\n")
+        helper_source = REPO_ROOT / "evaluation/context_compression_tier_b_runtime.sh"
+        helper_bytes = helper_source.read_bytes()
+        replacements = {
+            b"ROOT=/home/ron/hermes-compaction-tier-b": f"ROOT={cls.task_root}".encode(),
+            b"STARTING_HEAD=953491781ba8ec39cf4b5e15c9654eb7066b33f5": (
+                f"STARTING_HEAD={starting_head}".encode()
+            ),
+            b"CANDIDATE_SHA=f07664bb9a19788ec426db2eb8b8ec8d9572b21d": (
+                f"CANDIDATE_SHA={candidate_sha}".encode()
+            ),
+            b"BASELINE_SHA=d5e135a51353c2dbc489d5c2583158b22d8efd7b": (
+                f"BASELINE_SHA={baseline_sha}".encode()
+            ),
+        }
+        for old, replacement in replacements.items():
+            if helper_bytes.count(old) != 1:
+                raise AssertionError(f"helper replacement mismatch: {old!r}")
+            helper_bytes = helper_bytes.replace(old, replacement)
+        cls.helper = cls.root / "context_compression_tier_b_runtime.sh"
+        cls.helper.write_bytes(helper_bytes)
+        cls.helper.chmod(0o700)
+
         approved = (
             "evaluation/context_compression_tier_b.py",
             "evaluation/fixtures/context-compression-tier-b.json",
@@ -427,49 +458,25 @@ esac
         (source / "evaluation/context_compression_tier_b_runtime.sh").write_bytes(
             helper_bytes
         )
-        environment = {
-            **os.environ,
-            "GIT_AUTHOR_NAME": "Tier B test",
-            "GIT_AUTHOR_EMAIL": "tier-b-test@example.invalid",
-            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+0000",
-            "GIT_COMMITTER_NAME": "Tier B test",
-            "GIT_COMMITTER_EMAIL": "tier-b-test@example.invalid",
-            "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+0000",
-        }
-        committed = subprocess.run(
-            ["git", "-C", str(source), "add", "--", *approved],
-            capture_output=True,
-            text=True,
+        run_git("add", "--", *approved)
+        run_git(
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "tier b test",
         )
-        if committed.returncode:
-            raise AssertionError(committed.stderr)
-        committed = subprocess.run(
-            ["git", "-C", str(source), "commit", "--quiet", "-m", "tier b test"],
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        if committed.returncode:
-            raise AssertionError(committed.stderr)
         cls.evaluation_head = subprocess.check_output(
             ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
         ).strip()
         cls.bundle = cls.root / "evaluation.bundle"
-        bundled = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(source),
-                "bundle",
-                "create",
-                str(cls.bundle),
-                "refs/heads/eval/compaction-tier-a",
-            ],
-            capture_output=True,
-            text=True,
+        run_git(
+            "bundle",
+            "create",
+            str(cls.bundle),
+            "refs/heads/eval/compaction-tier-a",
         )
-        if bundled.returncode:
-            raise AssertionError(bundled.stderr)
         cls.bundle_bytes = cls.bundle.read_bytes()
         cls.bundle_sha256 = hashlib.sha256(cls.bundle_bytes).hexdigest()
 
