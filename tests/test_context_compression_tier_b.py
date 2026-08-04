@@ -712,6 +712,7 @@ esac
             any(value.endswith(",target=/benchmark/prepare-venv") for value in sync)
         )
         self.assertIn("uv sync --locked --python 3.13 --extra dev", " ".join(sync))
+        self.assertIn("--no-install-project", sync)
         self.assertIn("--name", prepare)
         self.assertIn("hermes-compaction-tier-b-prepare-run", prepare)
         self.assertIn("--network=none", prepare)

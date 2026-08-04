@@ -237,7 +237,7 @@ do_prepare() {
         --env PYTHONDONTWRITEBYTECODE=1 \
         --entrypoint=/bin/sh \
         "$BASE_IMAGE" -c \
-        'set -eu; umask 077; mkdir -p "$HOME"; exec uv sync --locked --python 3.13 --extra dev'
+        'set -eu; umask 077; mkdir -p "$HOME"; exec uv sync --locked --python 3.13 --extra dev --no-install-project'
     if podman container exists "$PREPARE_SYNC_CONTAINER"; then
         die PREPARE_SYNC_CONTAINER_REMAINED
     fi
