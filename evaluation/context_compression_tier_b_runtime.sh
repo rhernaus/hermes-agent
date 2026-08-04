@@ -71,9 +71,18 @@ require_task_names_absent() {
     fi
 }
 
+canonical_image_id() {
+    value=$1
+    code=$2
+    case "$value" in sha256:*) value=${value#sha256:} ;; esac
+    require_hex "$value" 64 "$code"
+    printf 'sha256:%s\n' "$value"
+}
+
 require_base_image() {
     observed=$(podman image inspect --format '{{.Id}}' "$BASE_IMAGE") \
         || die BASE_IMAGE_MISSING
+    observed=$(canonical_image_id "$observed" BASE_IMAGE_IDENTITY_MISMATCH)
     [ "$observed" = "$BASE_IMAGE" ] || die BASE_IMAGE_IDENTITY_MISMATCH
 }
 
@@ -274,9 +283,7 @@ do_build_image() {
         "$BUILD_CONTEXT"
     image_id=$(podman image inspect \
         --format '{{.Id}}' "localhost/hermes-compaction-tier-b:$evaluation_head")
-    case "$image_id" in sha256:????????????????????????????????????????????????????????????????) ;;
-        *) die RUNTIME_IMAGE_ID_INVALID ;;
-    esac
+    image_id=$(canonical_image_id "$image_id" RUNTIME_IMAGE_ID_INVALID)
     [ "$(podman image inspect --format '{{index .Labels "io.hermes.benchmark"}}' "$image_id")" = "$LABEL_VALUE" ] \
         || die IMAGE_LABEL_MISMATCH
     [ "$(podman image inspect --format '{{index .Labels "io.hermes.evaluation-head"}}' "$image_id")" = "$evaluation_head" ] \

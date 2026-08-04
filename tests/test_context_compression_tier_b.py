@@ -379,7 +379,7 @@ case "$1 ${2-}" in
     'info --format') printf 'true\\n' ;;
     'ps -a') /bin/cat "$FAKE_PODMAN_ROWS" ;;
     'container exists'|'network exists') exit 1 ;;
-    'image inspect') printf 'sha256:8539546b37868ca348618a8aa147ecfb68eb0caa8e597f98e649b42ed4e5c805\n' ;;
+    'image inspect') printf '8539546b37868ca348618a8aa147ecfb68eb0caa8e597f98e649b42ed4e5c805\n' ;;
     'run --rm')
         case " $* " in
             *' --name hermes-compaction-tier-b-prepare-sync '*)
@@ -567,6 +567,17 @@ esac
         ).read_text(encoding="utf-8")
         self.assertNotIn("/opt/data/", helper)
         self.assertNotIn("\nPRODUCTION_ID=", helper)
+
+    def test_image_id_canonicalization_is_shared_by_base_and_built_images(self):
+        helper = (
+            REPO_ROOT / "evaluation/context_compression_tier_b_runtime.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("canonical_image_id()", helper)
+        self.assertIn(
+            'canonical_image_id "$observed" BASE_IMAGE_IDENTITY_MISMATCH', helper
+        )
+        self.assertIn('canonical_image_id "$image_id" RUNTIME_IMAGE_ID_INVALID', helper)
+        self.assertEqual(helper.count('canonical_image_id "$'), 2)
 
     def test_all_production_queries_use_exact_name_filter(self):
         staged = self._stage()
