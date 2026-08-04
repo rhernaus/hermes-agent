@@ -3303,6 +3303,7 @@ def write_image_manifest(
 def verify_runtime_metadata(
     *,
     mounts_payload: str,
+    tmpfs_payload: str,
     networks_payload: str,
     ports_payload: str,
     environment_payload: str,
@@ -3311,6 +3312,7 @@ def verify_runtime_metadata(
     """Validate only the fixed task container metadata passed by the helper."""
     try:
         mounts = json.loads(mounts_payload)
+        tmpfs = json.loads(tmpfs_payload)
         networks = json.loads(networks_payload)
         ports = json.loads(ports_payload)
         environment = json.loads(environment_payload)
@@ -3335,11 +3337,13 @@ def verify_runtime_metadata(
             "/home/ron/hermes-compaction-tier-b/runtime/output",
             True,
         ),
-        "/benchmark/home": ("tmpfs", "", True),
-        "/benchmark/hermes": ("tmpfs", "", True),
-        "/benchmark/run": ("tmpfs", "", True),
-        "/tmp": ("tmpfs", "", True),
-        "/run": ("tmpfs", "", True),
+    }
+    expected_tmpfs = {
+        "/benchmark/home": {"rw", "nosuid", "nodev", "size=268435456", "mode=0700"},
+        "/benchmark/hermes": {"rw", "nosuid", "nodev", "size=268435456", "mode=0700"},
+        "/benchmark/run": {"rw", "nosuid", "nodev", "size=2147483648", "mode=0700"},
+        "/tmp": {"rw", "nosuid", "nodev", "size=1073741824", "mode=1777"},
+        "/run": {"rw", "nosuid", "nodev", "size=67108864", "mode=0755"},
     }
     observed: dict[str, tuple[str, str, bool]] = {}
     for mount in mounts:
@@ -3353,6 +3357,21 @@ def verify_runtime_metadata(
         )
     if observed != expected_mounts:
         raise ValueError("RUNTIME_MOUNT_MISMATCH")
+    if not isinstance(tmpfs, dict) or set(tmpfs) != set(expected_tmpfs):
+        raise ValueError("RUNTIME_TMPFS_MISMATCH")
+    allowed_extras = {"rprivate", "tmpcopyup"}
+    for destination, required_tokens in expected_tmpfs.items():
+        value = tmpfs.get(destination)
+        if not isinstance(value, str):
+            raise ValueError("RUNTIME_TMPFS_MISMATCH")
+        token_list = value.split(",")
+        tokens = set(token_list)
+        if (
+            len(tokens) != len(token_list)
+            or not required_tokens.issubset(tokens)
+            or not tokens.issubset(required_tokens | allowed_extras)
+        ):
+            raise ValueError("RUNTIME_TMPFS_MISMATCH")
     if not isinstance(environment, list):
         raise ValueError("RUNTIME_ENVIRONMENT_MISMATCH")
     env_map = dict(item.split("=", 1) for item in environment if "=" in item)
@@ -3374,7 +3393,11 @@ def verify_runtime_metadata(
     forbidden_names.discard("CODEX_HOME")
     if "CODEX_HOME" in env_map or any(name in env_map for name in forbidden_names):
         raise ValueError("RUNTIME_FORBIDDEN_ENVIRONMENT")
-    serialized = canonical_bytes({"mounts": mounts, "environment": environment})
+    serialized = canonical_bytes({
+        "mounts": mounts,
+        "tmpfs": tmpfs,
+        "environment": environment,
+    })
     if any(
         token in serialized
         for token in (b"/.hermes", b"/.codex", b"podman.sock", b"docker.sock")
@@ -4680,6 +4703,7 @@ def _build_parser() -> ArgumentParser:
     image.add_argument("--output", required=True, type=Path)
     metadata = commands.add_parser("verify-runtime-metadata")
     metadata.add_argument("--mounts", required=True)
+    metadata.add_argument("--tmpfs", required=True)
     metadata.add_argument("--networks", required=True)
     metadata.add_argument("--ports", required=True)
     metadata.add_argument("--environment", required=True)
@@ -4741,6 +4765,7 @@ def main(argv: list[str] | None = None) -> int:
     elif arguments.command == "verify-runtime-metadata":
         verify_runtime_metadata(
             mounts_payload=arguments.mounts,
+            tmpfs_payload=arguments.tmpfs,
             networks_payload=arguments.networks,
             ports_payload=arguments.ports,
             environment_payload=arguments.environment,

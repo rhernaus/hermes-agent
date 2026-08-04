@@ -790,7 +790,7 @@ esac
 
 
 class RuntimeMetadataPathContractTests(unittest.TestCase):
-    def test_runtime_metadata_requires_distinct_runtime_subtree_mounts(self):
+    def _valid_payloads(self):
         mounts = [
             {
                 "Destination": "/benchmark/input",
@@ -804,16 +804,14 @@ class RuntimeMetadataPathContractTests(unittest.TestCase):
                 "Source": "/home/ron/hermes-compaction-tier-b/runtime/output",
                 "RW": True,
             },
-        ] + [
-            {"Destination": destination, "Type": "tmpfs", "Source": "", "RW": True}
-            for destination in (
-                "/benchmark/home",
-                "/benchmark/hermes",
-                "/benchmark/run",
-                "/tmp",
-                "/run",
-            )
         ]
+        tmpfs = {
+            "/benchmark/home": "rw,nosuid,nodev,size=268435456,mode=0700,rprivate,tmpcopyup",
+            "/benchmark/hermes": "rw,nosuid,nodev,size=268435456,mode=0700,rprivate,tmpcopyup",
+            "/benchmark/run": "rw,nosuid,nodev,size=2147483648,mode=0700,rprivate,tmpcopyup",
+            "/tmp": "rw,nosuid,nodev,size=1073741824,mode=1777,rprivate,tmpcopyup",
+            "/run": "rw,nosuid,nodev,size=67108864,mode=0755,rprivate,tmpcopyup",
+        }
         environment = [
             "HOME=/benchmark/home",
             "HERMES_HOME=/benchmark/hermes",
@@ -822,22 +820,31 @@ class RuntimeMetadataPathContractTests(unittest.TestCase):
             "NO_COLOR=1",
             f"TIER_B_LIVE_ACK={tier_b.LIVE_ACK}",
         ]
+        return mounts, tmpfs, environment
+
+    def _verify(self, mounts, tmpfs, environment):
         tier_b.verify_runtime_metadata(
             mounts_payload=json.dumps(mounts),
+            tmpfs_payload=json.dumps(tmpfs),
             networks_payload=json.dumps({"hermes-compaction-tier-b-egress": {}}),
             ports_payload=json.dumps({}),
             environment_payload=json.dumps(environment),
             image_id="sha256:" + "9" * 64,
         )
+
+    def test_runtime_metadata_accepts_split_bind_and_tmpfs_schemas(self):
+        mounts, tmpfs, environment = self._valid_payloads()
+        self._verify(mounts, tmpfs, environment)
+
+    def test_runtime_metadata_rejects_wrong_bind_source_and_missing_tmpfs(self):
+        mounts, tmpfs, environment = self._valid_payloads()
         mounts[0]["Source"] = "/home/ron/hermes-compaction-tier-b/input"
         with self.assertRaisesRegex(ValueError, "RUNTIME_MOUNT_MISMATCH"):
-            tier_b.verify_runtime_metadata(
-                mounts_payload=json.dumps(mounts),
-                networks_payload=json.dumps({"hermes-compaction-tier-b-egress": {}}),
-                ports_payload=json.dumps({}),
-                environment_payload=json.dumps(environment),
-                image_id="sha256:" + "9" * 64,
-            )
+            self._verify(mounts, tmpfs, environment)
+        mounts, tmpfs, environment = self._valid_payloads()
+        del tmpfs["/run"]
+        with self.assertRaisesRegex(ValueError, "RUNTIME_TMPFS_MISMATCH"):
+            self._verify(mounts, tmpfs, environment)
 
 
 class ExecutableFinalizationContractTests(unittest.TestCase):

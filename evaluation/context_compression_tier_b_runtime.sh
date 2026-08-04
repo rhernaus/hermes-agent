@@ -388,11 +388,12 @@ do_preflight() {
     [ "$(podman container inspect --format '{{.HostConfig.PidsLimit}}' "$CONTAINER")" = 256 ] \
         || die PID_LIMIT_MISMATCH
     mounts=$(podman container inspect --format '{{json .Mounts}}' "$CONTAINER")
+    tmpfs=$(podman container inspect --format '{{json .HostConfig.Tmpfs}}' "$CONTAINER")
     networks=$(podman container inspect --format '{{json .NetworkSettings.Networks}}' "$CONTAINER")
     ports=$(podman container inspect --format '{{json .NetworkSettings.Ports}}' "$CONTAINER")
     env_json=$(podman container inspect --format '{{json .Config.Env}}' "$CONTAINER")
     /usr/bin/python3 "$EVALUATOR" verify-runtime-metadata \
-        --mounts "$mounts" --networks "$networks" --ports "$ports" \
+        --mounts "$mounts" --tmpfs "$tmpfs" --networks "$networks" --ports "$ports" \
         --environment "$env_json" --image-id "$image_id"
     config='model:\n  provider: openai-codex\n  default: gpt-5.6-sol\n  api_mode: codex_responses\nauxiliary:\n  transient_retries: 0\n  compression:\n    provider: openai-codex\n    model: gpt-5.6-luna\n    api_mode: codex_responses\n    timeout: 300\n'
     if ! podman exec "$CONTAINER" test -e /benchmark/hermes/config.yaml; then
