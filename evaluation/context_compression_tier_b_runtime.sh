@@ -8,6 +8,7 @@ PREPARE_VENV=$ROOT/prepare-venv
 INPUT=$RUNTIME/input
 OUTPUT=$RUNTIME/output
 BUILD_CONTEXT=$RUNTIME/build-context/evaluation-head
+EMPTY_IGNORE_FILE=$RUNTIME/.tier-b-empty.containerignore
 BUNDLE=$ROOT/evaluation.bundle
 PRODUCTION_ID_FILE=$ROOT/production-container-id-before.txt
 EXPECTED_HEAD_FILE=$ROOT/evaluation-head.txt
@@ -271,6 +272,10 @@ do_prepare() {
     if podman container exists "$PREPARE_RUN_CONTAINER"; then
         die PREPARE_RUN_CONTAINER_REMAINED
     fi
+    [ ! -e "$EMPTY_IGNORE_FILE" ] || die BUILD_IGNORE_FILE_ALREADY_EXISTS
+    umask 077
+    : >"$EMPTY_IGNORE_FILE"
+    chmod 0400 "$EMPTY_IGNORE_FILE"
     cp "$PRODUCTION_ID_FILE" "$INPUT/production-container-id-before.txt"
     require_production_continuity
 }
@@ -278,9 +283,12 @@ do_prepare() {
 do_build_image() {
     require_transaction
     [ -f "$INPUT/source-manifest.json" ] || die SOURCE_MANIFEST_MISSING
+    [ -f "$EMPTY_IGNORE_FILE" ] && [ ! -L "$EMPTY_IGNORE_FILE" ] || die BUILD_IGNORE_FILE_MISSING
+    [ "$(stat -c '%u:%s:%a' "$EMPTY_IGNORE_FILE")" = "$(id -u):0:400" ] || die BUILD_IGNORE_FILE_INVALID
     evaluation_head=$(read_manifest_field "$INPUT/source-manifest.json" evaluation_head)
     [ -n "$evaluation_head" ] || die EVALUATION_HEAD_MISSING
     podman build --pull=never --no-cache --network=slirp4netns \
+        --ignorefile "$EMPTY_IGNORE_FILE" \
         --label io.hermes.benchmark=context-compression-tier-b \
         --label "io.hermes.evaluation-head=$evaluation_head" \
         --file "$BUILD_CONTEXT/evaluation/Containerfile.context-compression-tier-b" \
