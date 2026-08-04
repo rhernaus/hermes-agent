@@ -4,6 +4,7 @@ set -eu
 ROOT=/home/ron/hermes-compaction-tier-b
 SOURCE_REPO=$ROOT/source-repo
 RUNTIME=$ROOT/runtime
+PREPARE_VENV=$ROOT/prepare-venv
 INPUT=$RUNTIME/input
 OUTPUT=$RUNTIME/output
 BUILD_CONTEXT=$RUNTIME/build-context/evaluation-head
@@ -11,6 +12,8 @@ BUNDLE=$ROOT/evaluation.bundle
 PRODUCTION_ID_FILE=$ROOT/production-container-id-before.txt
 EXPECTED_HEAD_FILE=$ROOT/evaluation-head.txt
 CONTAINER=hermes-compaction-tier-b-runner
+PREPARE_SYNC_CONTAINER=hermes-compaction-tier-b-prepare-sync
+PREPARE_RUN_CONTAINER=hermes-compaction-tier-b-prepare-run
 NETWORK=hermes-compaction-tier-b-egress
 LABEL_VALUE=context-compression-tier-b
 EVALUATION_BRANCH=eval/compaction-tier-a
@@ -58,12 +61,20 @@ discover_production_id() {
 }
 
 require_task_names_absent() {
-    if podman container exists "$CONTAINER"; then
-        die TASK_CONTAINER_NAME_COLLISION
-    fi
+    for name in "$CONTAINER" "$PREPARE_SYNC_CONTAINER" "$PREPARE_RUN_CONTAINER"; do
+        if podman container exists "$name"; then
+            die TASK_CONTAINER_NAME_COLLISION
+        fi
+    done
     if podman network exists "$NETWORK"; then
         die TASK_NETWORK_NAME_COLLISION
     fi
+}
+
+require_base_image() {
+    observed=$(podman image inspect --format '{{.Id}}' "$BASE_IMAGE") \
+        || die BASE_IMAGE_MISSING
+    [ "$observed" = "$BASE_IMAGE" ] || die BASE_IMAGE_IDENTITY_MISMATCH
 }
 
 require_task_root() {
@@ -194,17 +205,58 @@ finally:
 do_prepare() {
     require_transaction
     [ ! -e "$RUNTIME" ] || die RUNTIME_ROOT_ALREADY_EXISTS
+    [ ! -e "$PREPARE_VENV" ] || die PREPARE_VENV_ALREADY_EXISTS
     require_task_names_absent
     umask 077
-    mkdir "$RUNTIME"
-    chmod 0700 "$RUNTIME"
-    env \
-        -u OPENAI_API_KEY -u OPENROUTER_API_KEY -u ANTHROPIC_API_KEY \
-        -u NOUS_API_KEY -u GOOGLE_API_KEY -u GEMINI_API_KEY \
-        -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN \
-        -u GITHUB_TOKEN -u CODEX_HOME \
-        /usr/bin/python3 "$EVALUATOR" prepare \
-        --repo-root "$SOURCE_REPO" --runtime-root "$RUNTIME"
+    mkdir -m 0700 "$RUNTIME" "$PREPARE_VENV"
+    require_base_image
+    podman run --rm --pull=never \
+        --name "$PREPARE_SYNC_CONTAINER" \
+        --label "io.hermes.benchmark=$LABEL_VALUE" \
+        --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+        --pids-limit=512 --memory=2g --cpus=2 \
+        --network=slirp4netns:allow_host_loopback=false --http-proxy=false \
+        --userns=keep-id --user "$(id -u):$(id -g)" \
+        --tmpfs /tmp:rw,nosuid,nodev,size=1073741824,mode=1777 \
+        --tmpfs /run:rw,nosuid,nodev,size=16777216,mode=0755 \
+        --mount type=bind,source="$SOURCE_REPO",target=/benchmark/source,readonly \
+        --mount type=bind,source="$PREPARE_VENV",target=/benchmark/prepare-venv \
+        --workdir=/benchmark/source \
+        --env HOME=/tmp/home \
+        --env UV_NO_CACHE=1 \
+        --env UV_PROJECT_ENVIRONMENT=/benchmark/prepare-venv \
+        --env PYTHONDONTWRITEBYTECODE=1 \
+        --entrypoint=/bin/sh \
+        "$BASE_IMAGE" -c \
+        'set -eu; umask 077; mkdir -p "$HOME"; exec uv sync --locked --python 3.13 --extra dev'
+    if podman container exists "$PREPARE_SYNC_CONTAINER"; then
+        die PREPARE_SYNC_CONTAINER_REMAINED
+    fi
+    podman run --rm --pull=never \
+        --name "$PREPARE_RUN_CONTAINER" \
+        --label "io.hermes.benchmark=$LABEL_VALUE" \
+        --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+        --pids-limit=512 --memory=2g --cpus=2 \
+        --network=none --http-proxy=false \
+        --userns=keep-id --user "$(id -u):$(id -g)" \
+        --tmpfs /tmp:rw,nosuid,nodev,size=268435456,mode=1777 \
+        --tmpfs /run:rw,nosuid,nodev,size=16777216,mode=0755 \
+        --mount type=bind,source="$SOURCE_REPO",target=/benchmark/source,readonly \
+        --mount type=bind,source="$PREPARE_VENV",target=/benchmark/prepare-venv,readonly \
+        --mount type=bind,source="$RUNTIME",target=/benchmark/runtime \
+        --workdir=/benchmark/source \
+        --env HOME=/tmp/home \
+        --env HERMES_DISABLE_LAZY_INSTALLS=1 \
+        --env PYTHONDONTWRITEBYTECODE=1 \
+        --env PYTHONHASHSEED=0 \
+        --env NO_COLOR=1 \
+        --entrypoint=/benchmark/prepare-venv/bin/python \
+        "$BASE_IMAGE" \
+        /benchmark/source/evaluation/context_compression_tier_b.py prepare \
+        --repo-root /benchmark/source --runtime-root /benchmark/runtime
+    if podman container exists "$PREPARE_RUN_CONTAINER"; then
+        die PREPARE_RUN_CONTAINER_REMAINED
+    fi
     cp "$PRODUCTION_ID_FILE" "$INPUT/production-container-id-before.txt"
     require_production_continuity
 }

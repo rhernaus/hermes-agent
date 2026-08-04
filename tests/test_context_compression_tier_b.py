@@ -379,6 +379,24 @@ case "$1 ${2-}" in
     'info --format') printf 'true\\n' ;;
     'ps -a') /bin/cat "$FAKE_PODMAN_ROWS" ;;
     'container exists'|'network exists') exit 1 ;;
+    'image inspect') printf 'sha256:8539546b37868ca348618a8aa147ecfb68eb0caa8e597f98e649b42ed4e5c805\n' ;;
+    'run --rm')
+        case " $* " in
+            *' --name hermes-compaction-tier-b-prepare-sync '*)
+                case " $* " in
+                    *' UV_PROJECT_ENVIRONMENT=/benchmark/prepare-venv '*) ;;
+                    *) exit 96 ;;
+                esac
+                /bin/mkdir -p "$FAKE_TASK_ROOT/prepare-venv"
+                ;;
+            *' --name hermes-compaction-tier-b-prepare-run '*)
+                [ -z "$(/bin/ls -A "$FAKE_TASK_ROOT/runtime")" ] || exit 95
+                /bin/mkdir -p "$FAKE_TASK_ROOT/runtime/input"
+                printf '{"live_ready":true}\n' >"$FAKE_TASK_ROOT/runtime/input/source-manifest.json"
+                ;;
+            *) exit 97 ;;
+        esac
+        ;;
     *) exit 97 ;;
 esac
 """,
@@ -654,6 +672,58 @@ esac
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"PRODUCTION_IDENTITY_MISMATCH", result.stderr)
         self.assertFalse((self.task_root / "runtime").exists())
+
+    def test_prepare_uses_locked_sync_then_networkless_evaluator_container(self):
+        staged = self._stage()
+        self.assertEqual(staged.returncode, 0, staged.stderr.decode())
+        result = self._run_helper("prepare")
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        runs = [
+            shlex.split(line)
+            for line in self.podman_log.read_text(encoding="utf-8").splitlines()
+            if shlex.split(line)[:2] == ["run", "--rm"]
+        ]
+        self.assertEqual(len(runs), 2, runs)
+        sync, prepare = runs
+        for arguments in runs:
+            self.assertIn("--pull=never", arguments)
+            self.assertIn("--read-only", arguments)
+            self.assertIn("--cap-drop=ALL", arguments)
+            self.assertIn("--security-opt=no-new-privileges", arguments)
+            self.assertIn("--userns=keep-id", arguments)
+            self.assertIn("--label", arguments)
+            self.assertIn("io.hermes.benchmark=context-compression-tier-b", arguments)
+        self.assertIn("--name", sync)
+        self.assertIn("hermes-compaction-tier-b-prepare-sync", sync)
+        self.assertIn("--network=slirp4netns:allow_host_loopback=false", sync)
+        self.assertIn("UV_PROJECT_ENVIRONMENT=/benchmark/prepare-venv", sync)
+        self.assertTrue(
+            any(value.endswith(",target=/benchmark/prepare-venv") for value in sync)
+        )
+        self.assertIn("uv sync --locked --python 3.13 --extra dev", " ".join(sync))
+        self.assertIn("--name", prepare)
+        self.assertIn("hermes-compaction-tier-b-prepare-run", prepare)
+        self.assertIn("--network=none", prepare)
+        self.assertIn("--entrypoint=/benchmark/prepare-venv/bin/python", prepare)
+        self.assertTrue(
+            any(
+                value.endswith(",target=/benchmark/prepare-venv,readonly")
+                for value in prepare
+            )
+        )
+        self.assertIn(
+            "/benchmark/source/evaluation/context_compression_tier_b.py", prepare
+        )
+        self.assertNotIn(
+            "OPENAI_API_KEY", " ".join(value for run in runs for value in run)
+        )
+        self.assertTrue((self.task_root / "prepare-venv").is_dir())
+        self.assertEqual(
+            (
+                self.task_root / "runtime/input/production-container-id-before.txt"
+            ).read_text(encoding="ascii"),
+            self.PRODUCTION_ID + "\n",
+        )
 
 
 class RuntimeMetadataPathContractTests(unittest.TestCase):
