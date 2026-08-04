@@ -391,7 +391,7 @@ case "$1 ${2-}" in
         esac
         ;;
     'image inspect') printf '8539546b37868ca348618a8aa147ecfb68eb0caa8e597f98e649b42ed4e5c805\n' ;;
-    top*) printf 'PID         COMMAND\n1           /bin/sleep infinity\n' ;;
+    top*) printf 'PID         COMMAND\n1           /bin/sleep infinity   \n' ;;
     'run --rm')
         case " $* " in
             *' --name hermes-compaction-tier-b-prepare-sync '*)

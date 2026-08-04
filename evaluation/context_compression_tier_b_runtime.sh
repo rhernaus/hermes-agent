@@ -375,7 +375,7 @@ do_liveness() {
     top=$(podman top "$CONTAINER" pid,args)
     [ "$(printf '%s\n' "$top" | wc -l | tr -d ' ')" -eq 2 ] \
         || die TASK_PROCESS_SHAPE_INVALID
-    printf '%s\n' "$top" | tail -n 1 | grep -Eq '[[:space:]]/bin/sleep infinity$' \
+    printf '%s\n' "$top" | tail -n 1 | grep -Eq '[[:space:]]/bin/sleep infinity[[:space:]]*$' \
         || die TASK_PROCESS_SHAPE_INVALID
 }
 
