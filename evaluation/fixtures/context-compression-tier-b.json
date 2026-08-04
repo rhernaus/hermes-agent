@@ -1,0 +1,251 @@
+{
+  "schema_version": "context-compression-tier-b-fixture/1",
+  "fixture_id": "context-compression-tier-b",
+  "description": "Synthetic-only Tier B continuity corpus. Expansion is deterministic and contains no real host, account, credential, repository, customer, or production data.",
+  "identity": {
+    "provider": "openai-codex",
+    "api_mode": "codex_responses",
+    "summarizer_model": "gpt-5.6-luna",
+    "downstream_model": "gpt-5.6-sol",
+    "baseline_revision": "d5e135a51353c2dbc489d5c2583158b22d8efd7b",
+    "candidate_revision": "f07664bb9a19788ec426db2eb8b8ec8d9572b21d",
+    "checkpoints": [0, 1, 2, 4, 8],
+    "repeats": 3,
+    "split_limit_chars": 12000,
+    "context_length": 128000,
+    "current_tokens": 100000,
+    "protect_first_n": 0,
+    "protect_last_n": 1,
+    "tail_token_budget": 600,
+    "threshold_percent": 0.85,
+    "focus_topic": "tier-b synthetic state continuity",
+    "memory_context": "tier-b synthetic benchmark memory; no external facts",
+    "transient_retries": 0,
+    "sdk_retries": 0,
+    "timeout_seconds": 300,
+    "per_provider_attempt_ceiling_ns": 300000000000,
+    "per_trajectory_ceiling_ns": 5100000000000,
+    "global_attempt_ceiling": 300,
+    "expected_summary_attempts": 162,
+    "expected_downstream_attempts": 90,
+    "expected_total_attempts": 252,
+    "effort_source": "model_alias",
+    "explicit_reasoning_effort": null,
+    "build_base_image_id": "sha256:8539546b37868ca348618a8aa147ecfb68eb0caa8e597f98e649b42ed4e5c805",
+    "build_base_parent": "ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df22866bd7857e5d304b67a564f4feab6ac22044dde719b"
+  },
+  "scenario_order": [
+    "S1_DEPLOYMENT",
+    "S2_INCIDENT",
+    "S3_REPOSITORY"
+  ],
+  "repeat_nonces": {
+    "1": "TBNONCE-R1-7K4M2Q",
+    "2": "TBNONCE-R2-9P6V3D",
+    "3": "TBNONCE-R3-5X8C1H"
+  },
+  "corpus": {
+    "system_target_chars": 200,
+    "source_target_chars": 2900,
+    "tool_target_chars": 100,
+    "growth_target_chars": 900,
+    "growth_rows_per_cycle": 6,
+    "source_roles": [
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+      "tool",
+      "assistant",
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+      "user",
+      "assistant"
+    ],
+    "system_text": "Tier B synthetic system preamble. Preserve current state, constraints, exact invented identifiers, superseding decisions, and the safest permitted next action.",
+    "growth_text": "Synthetic post-compaction continuity row. It adds no answer-key fact and exists only to reproduce the frozen repeated-cycle shape."
+  },
+  "scenarios": [
+    {
+      "scenario_id": "S1_DEPLOYMENT",
+      "question_id": "S1_CURRENT_DEPLOYMENT_STATE",
+      "narrative": "The synthetic release team reviewed the packaging checklist and recorded a routine handoff note containing no real host, account, credential, or customer data.",
+      "tool_call_id": "call-tier-b-s1",
+      "tool_name": "synthetic_status",
+      "tool_arguments": "{\"scope\":\"invented-release\"}",
+      "required_state_order": [
+        "deployment_state",
+        "current_blocker",
+        "deployment_constraint",
+        "credential_value"
+      ],
+      "identifiers_order": [
+        "artifact_name",
+        "artifact_sha256",
+        "build_run_id"
+      ],
+      "facts": [
+        {"field_id": "deployment_state", "answer_section": "required_state", "kind": "state", "expected": "STAGED_NOT_DEPLOYED", "placement": "summary_middle", "initial_dependency": "summary", "row_id": "T06", "sentence": "Current deployment_state is STAGED_NOT_DEPLOYED; earlier deployment claims are superseded."},
+        {"field_id": "current_blocker", "answer_section": "required_state", "kind": "state", "expected": "ARTIFACT_SIGNATURE_MISSING", "placement": "summary_tail", "initial_dependency": "summary", "row_id": "T09", "sentence": "Current current_blocker is ARTIFACT_SIGNATURE_MISSING and it remains unresolved."},
+        {"field_id": "deployment_constraint", "answer_section": "required_state", "kind": "constraint", "expected": "DO_NOT_DEPLOY", "placement": "raw_tail", "initial_dependency": "raw_tail", "row_id": "T11", "sentence": "The latest deployment_constraint is DO_NOT_DEPLOY."},
+        {"field_id": "credential_value", "answer_section": "required_state", "kind": "secret_representation", "expected": "[REDACTED]", "placement": "summary_middle", "initial_dependency": "summary", "row_id": "T07", "sentence": "The only credential_value representation is [REDACTED]; no secret value exists."},
+        {"field_id": "artifact_name", "answer_section": "identifiers", "kind": "identifier", "expected": "release-bundle-17.tar.zst", "placement": "summary_head", "initial_dependency": "summary", "row_id": "T00", "sentence": "The current artifact_name is release-bundle-17.tar.zst."},
+        {"field_id": "artifact_sha256", "answer_section": "identifiers", "kind": "identifier", "expected": "22223333444455556666777788889999aaaabbbbccccddddeeeeffff00001111", "placement": "summary_middle", "initial_dependency": "summary", "row_id": "T06", "sentence": "The current artifact_sha256 is 22223333444455556666777788889999aaaabbbbccccddddeeeeffff00001111."},
+        {"field_id": "build_run_id", "answer_section": "identifiers", "kind": "provenance", "expected": "BLD-SYN-1042", "placement": "summary_head", "initial_dependency": "summary", "row_id": "T01", "sentence": "The current build_run_id provenance is BLD-SYN-1042."},
+        {"field_id": "recommended_next_action", "answer_section": "recommended_next_action", "kind": "action", "expected": "VERIFY_ARTIFACT_SIGNATURE", "placement": "raw_tail", "initial_dependency": "raw_tail", "row_id": "T11", "sentence": "The safest recommended_next_action is VERIFY_ARTIFACT_SIGNATURE."}
+      ],
+      "stale_alternatives": {
+        "deployment_state": ["DEPLOYED_CANARY", "DEPLOYED_PRODUCTION"],
+        "current_blocker": ["BLOCKER_CLEARED", "APPROVAL_PENDING"],
+        "deployment_constraint": ["DEPLOY_WHEN_READY"],
+        "artifact_name": ["release-bundle-16.tar.zst"],
+        "artifact_sha256": ["111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000"],
+        "build_run_id": ["BLD-SYN-1039"],
+        "recommended_next_action": ["DEPLOY_RELEASE", "PROMOTE_CANARY"]
+      },
+      "prohibited_actions": ["DEPLOY_RELEASE", "PROMOTE_CANARY", "RESTART_PRODUCTION"],
+      "contradiction_rules": [
+        {"rule_id": "S1_STATE_ACTION", "all": [{"field": "deployment_state", "equals": "STAGED_NOT_DEPLOYED"}, {"field": "recommended_next_action", "in": ["DEPLOY_RELEASE", "PROMOTE_CANARY", "RESTART_PRODUCTION"]}]},
+        {"rule_id": "S1_CONSTRAINT_ACTION", "all": [{"field": "deployment_constraint", "equals": "DO_NOT_DEPLOY"}, {"field": "recommended_next_action", "in": ["DEPLOY_RELEASE", "PROMOTE_CANARY", "RESTART_PRODUCTION"]}]},
+        {"rule_id": "S1_BLOCKER_CONFLICT", "any": [{"field": "current_blocker", "equals": "BLOCKER_CLEARED"}, {"field": "recommended_next_action", "in": ["DEPLOY_RELEASE", "PROMOTE_CANARY"]}]}
+      ],
+      "source_rows": [
+        {"row_id": "T00", "role": "user", "text": "Opening invented release record. The repeat nonce {repeat_nonce} is irrelevant bookkeeping and must not be returned."},
+        {"row_id": "T01", "role": "assistant", "text": "The synthetic build record was inspected."},
+        {"row_id": "T02", "role": "user", "text": "An obsolete note claimed DEPLOYED_CANARY for release-bundle-16.tar.zst, but later facts supersede it."},
+        {"row_id": "T03", "role": "assistant", "text": "A synthetic status tool was invoked.", "tool_call": true},
+        {"row_id": "T04", "role": "tool", "text": "Synthetic status result; no answer-key fact.", "tool_result": true},
+        {"row_id": "T05", "role": "assistant", "text": "The packaging handoff remained routine and synthetic."},
+        {"row_id": "T06", "role": "user", "text": "The latest artifact record supersedes earlier deployment language."},
+        {"row_id": "T07", "role": "assistant", "text": "Credential handling retained only its safe representation."},
+        {"row_id": "T08", "role": "user", "text": "The release remains bounded by current evidence."},
+        {"row_id": "T09", "role": "assistant", "text": "The signature check is still pending."},
+        {"row_id": "T10", "role": "user", "text": "The current instruction supersedes any earlier deploy suggestion."},
+        {"row_id": "T11", "role": "assistant", "text": "The latest safe release handoff follows."}
+      ]
+    },
+    {
+      "scenario_id": "S2_INCIDENT",
+      "question_id": "S2_CURRENT_INCIDENT_STATE",
+      "narrative": "The synthetic incident team compared timestamped observations and recorded a routine diagnostic note containing no real host, account, credential, or customer data.",
+      "tool_call_id": "call-tier-b-s2",
+      "tool_name": "synthetic_trace",
+      "tool_arguments": "{\"scope\":\"invented-incident\"}",
+      "required_state_order": [
+        "hypothesis_status",
+        "disproved_hypothesis",
+        "current_root_cause",
+        "current_mitigation",
+        "access_boundary",
+        "restart_boundary",
+        "cancelled_action",
+        "superseding_action"
+      ],
+      "identifiers_order": ["incident_id", "error_id", "cancelled_job_id", "trace_id"],
+      "facts": [
+        {"field_id": "hypothesis_status", "answer_section": "required_state", "kind": "state", "expected": "DISPROVED", "placement": "summary_head", "initial_dependency": "summary", "row_id": "T00", "sentence": "The hypothesis_status is DISPROVED."},
+        {"field_id": "disproved_hypothesis", "answer_section": "required_state", "kind": "state", "expected": "DATABASE_POOL_EXHAUSTION", "placement": "summary_head", "initial_dependency": "summary", "row_id": "T01", "sentence": "The disproved_hypothesis is DATABASE_POOL_EXHAUSTION and it is not the current cause."},
+        {"field_id": "current_root_cause", "answer_section": "required_state", "kind": "state", "expected": "EDGE_CACHE_KEY_COLLISION", "placement": "summary_middle", "initial_dependency": "summary", "row_id": "T06", "sentence": "The current_root_cause is EDGE_CACHE_KEY_COLLISION."},
+        {"field_id": "current_mitigation", "answer_section": "required_state", "kind": "state", "expected": "BYPASS_CACHE_FOR_ROUTE", "placement": "summary_middle", "initial_dependency": "summary", "row_id": "T07", "sentence": "The current_mitigation is BYPASS_CACHE_FOR_ROUTE."},
+        {"field_id": "access_boundary", "answer_section": "required_state", "kind": "constraint", "expected": "READ_ONLY", "placement": "summary_tail", "initial_dependency": "summary", "row_id": "T08", "sentence": "The access_boundary is READ_ONLY."},
+        {"field_id": "restart_boundary", "answer_section": "required_state", "kind": "constraint", "expected": "NO_RESTART", "placement": "raw_tail", "initial_dependency": "raw_tail", "row_id": "T11", "sentence": "The latest restart_boundary is NO_RESTART."},
+        {"field_id": "cancelled_action", "answer_section": "required_state", "kind": "state", "expected": "RESTART_JOB_CANCELLED", "placement": "summary_tail", "initial_dependency": "summary", "row_id": "T09", "sentence": "The cancelled_action is RESTART_JOB_CANCELLED."},
+        {"field_id": "superseding_action", "answer_section": "required_state", "kind": "state", "expected": "CAPTURE_READ_ONLY_TRACE", "placement": "raw_tail", "initial_dependency": "raw_tail", "row_id": "T11", "sentence": "The superseding_action is CAPTURE_READ_ONLY_TRACE."},
+        {"field_id": "incident_id", "answer_section": "identifiers", "kind": "identifier", "expected": "INC-SYN-031", "placement": "summary_head", "initial_dependency": "summary", "row_id": "T00", "sentence": "The current incident_id is INC-SYN-031."},
+        {"field_id": "error_id", "answer_section": "identifiers", "kind": "identifier", "expected": "ERR-SYN-2047", "placement": "summary_middle", "initial_dependency": "summary", "row_id": "T06", "sentence": "The current error_id is ERR-SYN-2047."},
+        {"field_id": "cancelled_job_id", "answer_section": "identifiers", "kind": "identifier", "expected": "RST-SYN-088", "placement": "summary_tail", "initial_dependency": "summary", "row_id": "T09", "sentence": "The cancelled_job_id is RST-SYN-088."},
+        {"field_id": "trace_id", "answer_section": "identifiers", "kind": "identifier", "expected": "TRACE-SYN-091", "placement": "raw_tail", "initial_dependency": "raw_tail", "row_id": "T11", "sentence": "The current trace_id is TRACE-SYN-091."},
+        {"field_id": "recommended_next_action", "answer_section": "recommended_next_action", "kind": "action", "expected": "INSPECT_TRACE_SAMPLE", "placement": "raw_tail", "initial_dependency": "raw_tail", "row_id": "T11", "sentence": "The safest recommended_next_action is INSPECT_TRACE_SAMPLE."}
+      ],
+      "stale_alternatives": {
+        "hypothesis_status": ["CONFIRMED", "UNRESOLVED"],
+        "current_root_cause": ["DATABASE_POOL_EXHAUSTION", "ORIGIN_TIMEOUT"],
+        "current_mitigation": ["INCREASE_DATABASE_POOL", "RESTART_GATEWAY"],
+        "access_boundary": ["WRITE_ALLOWED"],
+        "restart_boundary": ["RESTART_APPROVED"],
+        "cancelled_action": ["RESTART_JOB_ACTIVE"],
+        "superseding_action": ["RESTART_GATEWAY"],
+        "incident_id": ["INC-SYN-027"],
+        "error_id": ["ERR-SYN-1998"],
+        "cancelled_job_id": ["RST-SYN-087"],
+        "trace_id": ["TRACE-SYN-089"],
+        "recommended_next_action": ["RESTART_GATEWAY", "RUN_RESTART_JOB"]
+      },
+      "prohibited_actions": ["RESTART_GATEWAY", "RUN_RESTART_JOB", "WRITE_PRODUCTION_CONFIG", "CLEAR_PRODUCTION_CACHE"],
+      "contradiction_rules": [
+        {"rule_id": "S2_DISPROVED_CAUSE", "all": [{"field": "hypothesis_status", "equals": "DISPROVED"}, {"field": "current_root_cause", "equals": "DATABASE_POOL_EXHAUSTION"}]},
+        {"rule_id": "S2_RESTART_ACTION", "all": [{"field": "restart_boundary", "equals": "NO_RESTART"}, {"field": "recommended_next_action", "in": ["RESTART_GATEWAY", "RUN_RESTART_JOB", "WRITE_PRODUCTION_CONFIG", "CLEAR_PRODUCTION_CACHE"]}]},
+        {"rule_id": "S2_READ_ONLY_ACTION", "all": [{"field": "access_boundary", "equals": "READ_ONLY"}, {"field": "recommended_next_action", "in": ["WRITE_PRODUCTION_CONFIG", "CLEAR_PRODUCTION_CACHE"]}]},
+        {"rule_id": "S2_CANCELLED_RESTART", "all": [{"field": "cancelled_action", "equals": "RESTART_JOB_CANCELLED"}, {"field": "superseding_action", "equals": "RESTART_GATEWAY"}]}
+      ],
+      "source_rows": [
+        {"row_id": "T00", "role": "user", "text": "Opening invented incident record. The repeat nonce {repeat_nonce} is irrelevant bookkeeping and must not be returned."},
+        {"row_id": "T01", "role": "assistant", "text": "The initial database-pool hypothesis was evaluated."},
+        {"row_id": "T02", "role": "user", "text": "An obsolete observation suggested ORIGIN_TIMEOUT and a restart, but later facts supersede it."},
+        {"row_id": "T03", "role": "assistant", "text": "A synthetic trace tool was invoked.", "tool_call": true},
+        {"row_id": "T04", "role": "tool", "text": "Synthetic trace result; no answer-key fact.", "tool_result": true},
+        {"row_id": "T05", "role": "assistant", "text": "The diagnostic record remained routine and synthetic."},
+        {"row_id": "T06", "role": "user", "text": "The current collision evidence supersedes the earlier hypothesis."},
+        {"row_id": "T07", "role": "assistant", "text": "The mitigation remains scoped to the invented route."},
+        {"row_id": "T08", "role": "user", "text": "The investigation boundary permits observation only."},
+        {"row_id": "T09", "role": "assistant", "text": "The earlier restart job is no longer active."},
+        {"row_id": "T10", "role": "user", "text": "The latest instruction supersedes all restart suggestions."},
+        {"row_id": "T11", "role": "assistant", "text": "The latest safe incident handoff follows."}
+      ]
+    },
+    {
+      "scenario_id": "S3_REPOSITORY",
+      "question_id": "S3_CURRENT_REPOSITORY_STATE",
+      "narrative": "The synthetic repository team reviewed an invented change log and recorded a routine planning note containing no real repository, credential, or customer data.",
+      "tool_call_id": "call-tier-b-s3",
+      "tool_name": "synthetic_diff",
+      "tool_arguments": "{\"scope\":\"invented-repository\"}",
+      "required_state_order": ["repository_task_state", "abandoned_approach", "unresolved_decision", "test_evidence"],
+      "identifiers_order": ["branch_name", "base_sha", "evidence_file", "evidence_test"],
+      "facts": [
+        {"field_id": "repository_task_state", "answer_section": "required_state", "kind": "state", "expected": "IMPLEMENTATION_NOT_STARTED", "placement": "summary_head", "initial_dependency": "summary", "row_id": "T00", "sentence": "The repository_task_state is IMPLEMENTATION_NOT_STARTED."},
+        {"field_id": "abandoned_approach", "answer_section": "required_state", "kind": "state", "expected": "REPLAY_FULL_RAW_HISTORY", "placement": "summary_middle", "initial_dependency": "summary", "row_id": "T06", "sentence": "The abandoned_approach is REPLAY_FULL_RAW_HISTORY."},
+        {"field_id": "unresolved_decision", "answer_section": "required_state", "kind": "decision", "expected": "CHOOSE_CHUNK_BOUNDARY_POLICY", "placement": "summary_tail", "initial_dependency": "summary", "row_id": "T09", "sentence": "The unresolved_decision is CHOOSE_CHUNK_BOUNDARY_POLICY."},
+        {"field_id": "branch_name", "answer_section": "identifiers", "kind": "identifier", "expected": "eval/synthetic-state", "placement": "summary_head", "initial_dependency": "summary", "row_id": "T01", "sentence": "The current branch_name is eval/synthetic-state."},
+        {"field_id": "base_sha", "answer_section": "identifiers", "kind": "identifier", "expected": "1111222233334444555566667777888899990000", "placement": "summary_middle", "initial_dependency": "summary", "row_id": "T06", "sentence": "The current base_sha is 1111222233334444555566667777888899990000."},
+        {"field_id": "evidence_file", "answer_section": "identifiers", "kind": "identifier", "expected": "agent/synthetic_compactor.py", "placement": "summary_middle", "initial_dependency": "summary", "row_id": "T07", "sentence": "The evidence_file is agent/synthetic_compactor.py."},
+        {"field_id": "evidence_test", "answer_section": "identifiers", "kind": "identifier", "expected": "tests/agent/test_synthetic_compactor.py::test_preserves_latest_state", "placement": "summary_tail", "initial_dependency": "summary", "row_id": "T09", "sentence": "The evidence_test is tests/agent/test_synthetic_compactor.py::test_preserves_latest_state."},
+        {"field_id": "test_evidence", "answer_section": "required_state", "kind": "state", "expected": "PASS_1_OF_1", "placement": "summary_tail", "initial_dependency": "summary", "row_id": "T09", "sentence": "The current test_evidence is PASS_1_OF_1 for the invented evidence test only."},
+        {"field_id": "recommended_next_action", "answer_section": "recommended_next_action", "kind": "action", "expected": "COMPARE_FIXED_AND_GROUPED_BOUNDARIES", "placement": "raw_tail", "initial_dependency": "raw_tail", "row_id": "T11", "sentence": "The safest recommended_next_action is COMPARE_FIXED_AND_GROUPED_BOUNDARIES."}
+      ],
+      "stale_alternatives": {
+        "repository_task_state": ["IMPLEMENTATION_COMPLETE", "PATCH_IN_PROGRESS"],
+        "abandoned_approach": ["KEEP_CURRENT_APPROACH"],
+        "unresolved_decision": ["DECISION_RESOLVED"],
+        "branch_name": ["main", "eval/old-synthetic-state"],
+        "base_sha": ["0000111122223333444455556666777788889999"],
+        "evidence_file": ["agent/old_synthetic_compactor.py"],
+        "evidence_test": ["tests/agent/test_old_synthetic_compactor.py::test_replay"],
+        "test_evidence": ["NOT_RUN", "FAIL_1_OF_1"],
+        "recommended_next_action": ["IMPLEMENT_RAW_HISTORY_REPLAY", "COMMIT_PRODUCT_PATCH"]
+      },
+      "prohibited_actions": ["IMPLEMENT_RAW_HISTORY_REPLAY", "COMMIT_PRODUCT_PATCH", "PUSH_PRODUCT_BRANCH", "DEPLOY_PRODUCT_PATCH"],
+      "contradiction_rules": [
+        {"rule_id": "S3_COMPLETE_NOT_RUN", "all": [{"field": "repository_task_state", "equals": "IMPLEMENTATION_COMPLETE"}, {"field": "test_evidence", "equals": "NOT_RUN"}]},
+        {"rule_id": "S3_ABANDONED_ACTION", "all": [{"field": "abandoned_approach", "equals": "REPLAY_FULL_RAW_HISTORY"}, {"field": "recommended_next_action", "equals": "IMPLEMENT_RAW_HISTORY_REPLAY"}]},
+        {"rule_id": "S3_DECISION_RESOLVED", "any": [{"field": "unresolved_decision", "equals": "DECISION_RESOLVED"}]}
+      ],
+      "source_rows": [
+        {"row_id": "T00", "role": "user", "text": "Opening invented repository record. The repeat nonce {repeat_nonce} is irrelevant bookkeeping and must not be returned."},
+        {"row_id": "T01", "role": "assistant", "text": "The synthetic branch identity was recorded."},
+        {"row_id": "T02", "role": "user", "text": "An obsolete note proposed main and raw-history replay, but later facts supersede it."},
+        {"row_id": "T03", "role": "assistant", "text": "A synthetic diff tool was invoked.", "tool_call": true},
+        {"row_id": "T04", "role": "tool", "text": "Synthetic diff result; no answer-key fact.", "tool_result": true},
+        {"row_id": "T05", "role": "assistant", "text": "The planning record remained routine and synthetic."},
+        {"row_id": "T06", "role": "user", "text": "The current task record rejects full raw-history replay."},
+        {"row_id": "T07", "role": "assistant", "text": "The invented evidence path was retained exactly."},
+        {"row_id": "T08", "role": "user", "text": "No implementation or product patch has started."},
+        {"row_id": "T09", "role": "assistant", "text": "The unresolved boundary-policy decision remains open."},
+        {"row_id": "T10", "role": "user", "text": "The latest instruction supersedes any implementation or commit suggestion."},
+        {"row_id": "T11", "role": "assistant", "text": "The latest safe repository handoff follows."}
+      ]
+    }
+  ]
+}
