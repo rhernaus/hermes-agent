@@ -806,15 +806,15 @@ class RuntimeMetadataPathContractTests(unittest.TestCase):
             },
         ]
         tmpfs = {
-            "/benchmark/home": "rw,nosuid,nodev,size=268435456,mode=0700,rprivate,tmpcopyup",
-            "/benchmark/hermes": "rw,nosuid,nodev,size=268435456,mode=0700,rprivate,tmpcopyup",
-            "/benchmark/run": "rw,nosuid,nodev,size=2147483648,mode=0700,rprivate,tmpcopyup",
+            "/benchmark/home": "rw,nosuid,nodev,size=268435456,mode=1777,rprivate,tmpcopyup",
+            "/benchmark/hermes": "rw,nosuid,nodev,size=268435456,mode=1777,rprivate,tmpcopyup",
+            "/benchmark/run": "rw,nosuid,nodev,size=2147483648,mode=1777,rprivate,tmpcopyup",
             "/tmp": "rw,nosuid,nodev,size=1073741824,mode=1777,rprivate,tmpcopyup",
             "/run": "rw,nosuid,nodev,size=67108864,mode=0755,rprivate,tmpcopyup",
         }
         environment = [
-            "HOME=/benchmark/home",
-            "HERMES_HOME=/benchmark/hermes",
+            "HOME=/benchmark/home/user",
+            "HERMES_HOME=/benchmark/hermes/user",
             "HERMES_DISABLE_LAZY_INSTALLS=1",
             "PYTHONDONTWRITEBYTECODE=1",
             "NO_COLOR=1",
@@ -830,6 +830,7 @@ class RuntimeMetadataPathContractTests(unittest.TestCase):
             ports_payload=json.dumps({}),
             environment_payload=json.dumps(environment),
             image_id="sha256:" + "9" * 64,
+            runtime_user="1000:1000",
         )
 
     def test_runtime_metadata_accepts_split_bind_and_tmpfs_schemas(self):

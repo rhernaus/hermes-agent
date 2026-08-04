@@ -333,6 +333,8 @@ do_verify_image() {
 do_start() {
     require_transaction
     image_id=$(read_manifest_field "$INPUT/image-manifest.json" tier_b_image_id)
+    runtime_uid=$(id -u)
+    runtime_gid=$(id -g)
     require_task_names_absent
     podman network create \
         --label io.hermes.benchmark=context-compression-tier-b \
@@ -342,20 +344,20 @@ do_start() {
         --label io.hermes.benchmark=context-compression-tier-b \
         --pull=never --read-only --cap-drop=ALL \
         --security-opt=no-new-privileges --pids-limit=256 --userns=keep-id \
-        --network="$NETWORK" \
+        --user "$runtime_uid:$runtime_gid" --network="$NETWORK" \
         --mount "type=bind,src=$INPUT,dst=/benchmark/input,ro=true" \
         --mount "type=bind,src=$OUTPUT,dst=/benchmark/output,rw=true" \
-        --tmpfs /benchmark/home:rw,nosuid,nodev,size=268435456,mode=0700 \
-        --tmpfs /benchmark/hermes:rw,nosuid,nodev,size=268435456,mode=0700 \
-        --tmpfs /benchmark/run:rw,nosuid,nodev,size=2147483648,mode=0700 \
+        --tmpfs /benchmark/home:rw,nosuid,nodev,size=268435456,mode=1777 \
+        --tmpfs /benchmark/hermes:rw,nosuid,nodev,size=268435456,mode=1777 \
+        --tmpfs /benchmark/run:rw,nosuid,nodev,size=2147483648,mode=1777 \
         --tmpfs /tmp:rw,nosuid,nodev,size=1073741824,mode=1777 \
         --tmpfs /run:rw,nosuid,nodev,size=67108864,mode=0755 \
-        --env HOME=/benchmark/home --env HERMES_HOME=/benchmark/hermes \
+        --env HOME=/benchmark/home/user --env HERMES_HOME=/benchmark/hermes/user \
         --env PYTHONDONTWRITEBYTECODE=1 --env HERMES_DISABLE_LAZY_INSTALLS=1 \
         --env NO_COLOR=1 \
         --env TIER_B_LIVE_ACK=CONTEXT_COMPRESSION_TIER_B_AUTHORIZED \
-        --workdir /opt/hermes --entrypoint=/bin/sleep \
-        "$image_id" infinity >/dev/null
+        --workdir /opt/hermes --entrypoint=/bin/sh \
+        "$image_id" -c 'umask 077; mkdir -m 700 /benchmark/home/user /benchmark/hermes/user /benchmark/run/user; exec /bin/sleep infinity' >/dev/null
     do_liveness
 }
 
@@ -392,31 +394,36 @@ do_preflight() {
     networks=$(podman container inspect --format '{{json .NetworkSettings.Networks}}' "$CONTAINER")
     ports=$(podman container inspect --format '{{json .NetworkSettings.Ports}}' "$CONTAINER")
     env_json=$(podman container inspect --format '{{json .Config.Env}}' "$CONTAINER")
+    runtime_user=$(podman container inspect --format '{{.Config.User}}' "$CONTAINER")
+    [ "$runtime_user" = "$(id -u):$(id -g)" ] || die RUNTIME_USER_MISMATCH
+    private_metadata=$(podman exec "$CONTAINER" /usr/bin/stat -c '%u:%g:%a' /benchmark/home/user /benchmark/hermes/user /benchmark/run/user)
+    expected_private=$(printf '%s:%s:700\n%s:%s:700\n%s:%s:700' "$(id -u)" "$(id -g)" "$(id -u)" "$(id -g)" "$(id -u)" "$(id -g)")
+    [ "$private_metadata" = "$expected_private" ] || die RUNTIME_PRIVATE_DIRECTORY_MISMATCH
     /usr/bin/python3 "$EVALUATOR" verify-runtime-metadata \
         --mounts "$mounts" --tmpfs "$tmpfs" --networks "$networks" --ports "$ports" \
-        --environment "$env_json" --image-id "$image_id"
+        --environment "$env_json" --image-id "$image_id" --runtime-user "$runtime_user"
     config='model:\n  provider: openai-codex\n  default: gpt-5.6-sol\n  api_mode: codex_responses\nauxiliary:\n  transient_retries: 0\n  compression:\n    provider: openai-codex\n    model: gpt-5.6-luna\n    api_mode: codex_responses\n    timeout: 300\n'
-    if ! podman exec "$CONTAINER" test -e /benchmark/hermes/config.yaml; then
+    if ! podman exec "$CONTAINER" test -e /benchmark/hermes/user/config.yaml; then
         printf '%b' "$config" | podman exec -i "$CONTAINER" /bin/sh -c \
-            'umask 077; cat > /benchmark/hermes/config.yaml'
+            'umask 077; cat > /benchmark/hermes/user/config.yaml'
     fi
     podman exec --workdir /opt/hermes "$CONTAINER" \
         /opt/hermes/.venv/bin/python /opt/hermes/evaluation/context_compression_tier_b.py attest-runtime \
         --manifest /benchmark/input/source-manifest.json \
         --image-manifest /benchmark/input/image-manifest.json \
         --schedule /benchmark/input/execution-schedule.json \
-        --run-root /benchmark/run --output-root /benchmark/output
+        --run-root /benchmark/run/user --output-root /benchmark/output
 }
 
 do_auth_status() {
     do_liveness
     podman exec "$CONTAINER" /bin/sh -c \
-        '/opt/hermes/.venv/bin/hermes auth status openai-codex >/benchmark/run/auth-status.untrusted 2>&1' \
+        '/opt/hermes/.venv/bin/hermes auth status openai-codex >/benchmark/run/user/auth-status.untrusted 2>&1' \
         || die AUTH_STATUS_FAILED
     podman exec --workdir /opt/hermes "$CONTAINER" \
         /opt/hermes/.venv/bin/python /opt/hermes/evaluation/context_compression_tier_b.py sanitize-auth-status \
-        --input /benchmark/run/auth-status.untrusted \
-        --output /benchmark/run/auth-attestation.json
+        --input /benchmark/run/user/auth-status.untrusted \
+        --output /benchmark/run/user/auth-attestation.json
 }
 
 do_finalize() {

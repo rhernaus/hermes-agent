@@ -3308,6 +3308,7 @@ def verify_runtime_metadata(
     ports_payload: str,
     environment_payload: str,
     image_id: str,
+    runtime_user: str,
 ) -> None:
     """Validate only the fixed task container metadata passed by the helper."""
     try:
@@ -3320,6 +3321,10 @@ def verify_runtime_metadata(
         raise ValueError("RUNTIME_METADATA_MALFORMED") from exc
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
         raise ValueError("RUNTIME_IMAGE_ID_INVALID")
+    user_match = re.fullmatch(r"([1-9][0-9]*):([1-9][0-9]*)", runtime_user)
+    if user_match is None:
+        raise ValueError("RUNTIME_USER_INVALID")
+    runtime_uid, runtime_gid = user_match.groups()
     if not isinstance(networks, dict) or set(networks) != {
         "hermes-compaction-tier-b-egress"
     }:
@@ -3339,9 +3344,27 @@ def verify_runtime_metadata(
         ),
     }
     expected_tmpfs = {
-        "/benchmark/home": {"rw", "nosuid", "nodev", "size=268435456", "mode=0700"},
-        "/benchmark/hermes": {"rw", "nosuid", "nodev", "size=268435456", "mode=0700"},
-        "/benchmark/run": {"rw", "nosuid", "nodev", "size=2147483648", "mode=0700"},
+        "/benchmark/home": {
+            "rw",
+            "nosuid",
+            "nodev",
+            "size=268435456",
+            "mode=1777",
+        },
+        "/benchmark/hermes": {
+            "rw",
+            "nosuid",
+            "nodev",
+            "size=268435456",
+            "mode=1777",
+        },
+        "/benchmark/run": {
+            "rw",
+            "nosuid",
+            "nodev",
+            "size=2147483648",
+            "mode=1777",
+        },
         "/tmp": {"rw", "nosuid", "nodev", "size=1073741824", "mode=1777"},
         "/run": {"rw", "nosuid", "nodev", "size=67108864", "mode=0755"},
     }
@@ -3376,8 +3399,8 @@ def verify_runtime_metadata(
         raise ValueError("RUNTIME_ENVIRONMENT_MISMATCH")
     env_map = dict(item.split("=", 1) for item in environment if "=" in item)
     required = {
-        "HOME": "/benchmark/home",
-        "HERMES_HOME": "/benchmark/hermes",
+        "HOME": "/benchmark/home/user",
+        "HERMES_HOME": "/benchmark/hermes/user",
         "HERMES_DISABLE_LAZY_INSTALLS": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
         "NO_COLOR": "1",
@@ -4708,6 +4731,7 @@ def _build_parser() -> ArgumentParser:
     metadata.add_argument("--ports", required=True)
     metadata.add_argument("--environment", required=True)
     metadata.add_argument("--image-id", required=True)
+    metadata.add_argument("--runtime-user", required=True)
     attest = commands.add_parser("attest-runtime")
     attest.add_argument("--manifest", required=True, type=Path)
     attest.add_argument("--image-manifest", required=True, type=Path)
@@ -4770,6 +4794,7 @@ def main(argv: list[str] | None = None) -> int:
             ports_payload=arguments.ports,
             environment_payload=arguments.environment,
             image_id=arguments.image_id,
+            runtime_user=arguments.runtime_user,
         )
     elif arguments.command == "attest-runtime":
         attest_runtime(
