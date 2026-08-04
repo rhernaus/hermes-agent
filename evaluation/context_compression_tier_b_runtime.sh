@@ -134,7 +134,12 @@ read_manifest_field() {
 require_task_label() {
     object_type=$1
     object_name=$2
-    [ "$(podman "$object_type" inspect --format '{{index .Labels "io.hermes.benchmark"}}' "$object_name")" = "$LABEL_VALUE" ] \
+    case "$object_type" in
+        container) label_template='{{index .Config.Labels "io.hermes.benchmark"}}' ;;
+        image|network) label_template='{{index .Labels "io.hermes.benchmark"}}' ;;
+        *) die TASK_OBJECT_TYPE_INVALID ;;
+    esac
+    [ "$(podman "$object_type" inspect --format "$label_template" "$object_name")" = "$LABEL_VALUE" ] \
         || die TASK_LABEL_MISMATCH
 }
 
@@ -364,8 +369,9 @@ do_liveness() {
         || die TASK_CONTAINER_NOT_RUNNING
     [ "$(podman container inspect --format '{{.State.ExitCode}}' "$CONTAINER")" = 0 ] \
         || die TASK_CONTAINER_EXIT_NONZERO
-    [ "$(podman container inspect --format '{{.Image}}' "$CONTAINER")" = "$image_id" ] \
-        || die TASK_CONTAINER_IMAGE_MISMATCH
+    container_image=$(podman container inspect --format '{{.Image}}' "$CONTAINER")
+    container_image=$(canonical_image_id "$container_image" TASK_CONTAINER_IMAGE_MISMATCH)
+    [ "$container_image" = "$image_id" ] || die TASK_CONTAINER_IMAGE_MISMATCH
     top=$(podman top "$CONTAINER" pid,args)
     [ "$(printf '%s\n' "$top" | wc -l | tr -d ' ')" -eq 2 ] \
         || die TASK_PROCESS_SHAPE_INVALID

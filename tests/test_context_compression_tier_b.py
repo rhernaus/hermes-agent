@@ -343,6 +343,7 @@ def make_runtime_attestation_fixture(root):
 
 class RuntimeHelperSourceStagingContractTests(unittest.TestCase):
     PRODUCTION_ID = "1" * 64
+    TASK_IMAGE_ID = "a" * 64
 
     @classmethod
     def setUpClass(cls):
@@ -379,7 +380,18 @@ case "$1 ${2-}" in
     'info --format') printf 'true\\n' ;;
     'ps -a') /bin/cat "$FAKE_PODMAN_ROWS" ;;
     'container exists'|'network exists') exit 1 ;;
+    'container inspect')
+        case "$*" in
+            *'.Config.Labels'*) printf 'context-compression-tier-b\n' ;;
+            *'.State.Status'*) printf 'running\n' ;;
+            *'.State.Running'*) printf 'true\n' ;;
+            *'.State.ExitCode'*) printf '0\n' ;;
+            *'{{.Image}}'*) printf '%s\n' "$FAKE_TASK_IMAGE_ID" ;;
+            *) exit 97 ;;
+        esac
+        ;;
     'image inspect') printf '8539546b37868ca348618a8aa147ecfb68eb0caa8e597f98e649b42ed4e5c805\n' ;;
+    top*) printf 'PID         COMMAND\n1           /bin/sleep infinity\n' ;;
     'run --rm')
         case " $* " in
             *' --name hermes-compaction-tier-b-prepare-sync '*)
@@ -532,13 +544,14 @@ esac
     def _set_production_rows(self, rows):
         self.podman_rows.write_text(rows, encoding="utf-8")
 
-    def _run_helper(self, *arguments, payload=b""):
+    def _run_helper(self, *arguments, payload=b"", task_image=None):
         environment = {
             **os.environ,
             "PATH": f"{self.fake_bin}:{os.environ['PATH']}",
             "FAKE_PODMAN_ROWS": str(self.podman_rows),
             "FAKE_PODMAN_LOG": str(self.podman_log),
             "FAKE_TASK_ROOT": str(self.task_root),
+            "FAKE_TASK_IMAGE_ID": task_image or self.TASK_IMAGE_ID,
         }
         return subprocess.run(
             [str(self.helper), *arguments],
@@ -568,6 +581,40 @@ esac
         self.assertNotIn("/opt/data/", helper)
         self.assertNotIn("\nPRODUCTION_ID=", helper)
 
+    def _prepare_liveness_transaction(self):
+        staged = self._stage()
+        self.assertEqual(staged.returncode, 0, staged.stderr.decode())
+        input_root = self.task_root / "runtime/input"
+        input_root.mkdir(parents=True)
+        (input_root / "image-manifest.json").write_text(
+            json.dumps({"tier_b_image_id": f"sha256:{self.TASK_IMAGE_ID}"}) + "\n",
+            encoding="utf-8",
+        )
+
+    def test_liveness_accepts_live_podman_label_and_bare_image_id(self):
+        self._prepare_liveness_transaction()
+        result = self._run_helper("liveness")
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        log = self.podman_log.read_text(encoding="utf-8")
+        self.assertIn('.Config.Labels "io.hermes.benchmark"', log)
+        self.assertIn("container inspect --format {{.Image}}", log)
+        self.assertIn("top hermes-compaction-tier-b-runner pid,args", log)
+
+    def test_liveness_rejects_malformed_and_mismatched_container_image(self):
+        self._prepare_liveness_transaction()
+        for observed in ("not-a-hash", "b" * 64):
+            with self.subTest(observed=observed):
+                result = self._run_helper("liveness", task_image=observed)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("TASK_CONTAINER_IMAGE_MISMATCH", result.stderr.decode())
+
+    def test_task_label_paths_match_podman_object_schemas(self):
+        helper = (
+            REPO_ROOT / "evaluation/context_compression_tier_b_runtime.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("container) label_template='{{index .Config.Labels", helper)
+        self.assertIn("image|network) label_template='{{index .Labels", helper)
+
     def test_image_id_canonicalization_is_shared_by_base_and_built_images(self):
         helper = (
             REPO_ROOT / "evaluation/context_compression_tier_b_runtime.sh"
@@ -577,7 +624,11 @@ esac
             'canonical_image_id "$observed" BASE_IMAGE_IDENTITY_MISMATCH', helper
         )
         self.assertIn('canonical_image_id "$image_id" RUNTIME_IMAGE_ID_INVALID', helper)
-        self.assertEqual(helper.count('canonical_image_id "$'), 2)
+        self.assertIn(
+            'canonical_image_id "$container_image" TASK_CONTAINER_IMAGE_MISMATCH',
+            helper,
+        )
+        self.assertEqual(helper.count('canonical_image_id "$'), 3)
 
     def test_all_production_queries_use_exact_name_filter(self):
         staged = self._stage()
