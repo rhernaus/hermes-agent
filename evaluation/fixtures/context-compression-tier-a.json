@@ -1,0 +1,284 @@
+{
+  "schema_version": "context-compression-tier-a-fixture/1",
+  "fixture_id": "context-compression-tier-a",
+  "description": "Sanitized synthetic transcript for the Tier A context-compaction comparison. Every string here is invented; no real conversation, path, or credential is reproduced. Row contents are built deterministically as marker + text + optional inserts + pad_char repeated pad_count times, so the fixture stays small while the exact bytes remain pinned by the file hash.",
+  "critical_marker": "TIER_A_CRITICAL_MIDDLE",
+  "fake_secret": "sk-proj-FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfake",
+  "pruned_skill_marker": "[SKILL_PRUNED: content lost in compression; reload with skill_view(name='tier-a-skill')]",
+  "tool_call_id": "call-tier-a-1",
+  "tool_name": "terminal",
+  "tool_arguments": "{\"command\": \"echo tier-a\"}",
+  "main_session": {
+    "session_label": "tier-a-main",
+    "marker_order": [
+      "TIER_A_M00",
+      "TIER_A_M01",
+      "TIER_A_M02",
+      "TIER_A_M03",
+      "TIER_A_M04",
+      "TIER_A_M05",
+      "TIER_A_M06",
+      "TIER_A_M07",
+      "TIER_A_M08",
+      "TIER_A_M09",
+      "TIER_A_M10",
+      "TIER_A_M11"
+    ],
+    "rows": [
+      {
+        "role": "system",
+        "marker": null,
+        "text": "tier-a synthetic system preamble",
+        "pad_char": "s",
+        "pad_count": 200
+      },
+      {
+        "role": "user",
+        "marker": "TIER_A_M00",
+        "text": "opening synthetic request",
+        "pad_char": "a",
+        "pad_count": 2900
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_M01",
+        "text": "synthetic acknowledgement",
+        "pad_char": "b",
+        "pad_count": 2900
+      },
+      {
+        "role": "user",
+        "marker": "TIER_A_M02",
+        "text": "synthetic follow-up carrying a fake credential",
+        "pad_char": "c",
+        "pad_count": 2900,
+        "include_secret": true
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_M03",
+        "text": "synthetic tool invocation turn",
+        "pad_char": "d",
+        "pad_count": 2900,
+        "tool_calls": [
+          {
+            "id": "call-tier-a-1",
+            "type": "function",
+            "function": {
+              "name": "terminal",
+              "arguments": "{\"command\": \"echo tier-a\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "marker": "TIER_A_M04",
+        "text": "synthetic tool result body",
+        "pad_char": "e",
+        "pad_count": 100,
+        "tool_call_id": "call-tier-a-1",
+        "note": "Held under the 200-char cheap-pre-pass prune floor so this row survives verbatim through repeated compaction cycles; otherwise its marker would be replaced by a generated one-line tool summary and marker-retention gating would measure the harness, not the candidate."
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_M05",
+        "text": "synthetic turn carrying a pruned-skill marker",
+        "pad_char": "f",
+        "pad_count": 2900,
+        "include_pruned_skill": true
+      },
+      {
+        "role": "user",
+        "marker": "TIER_A_M06",
+        "text": "synthetic mid-window turn carrying the critical fact",
+        "pad_char": "g",
+        "pad_count": 2900,
+        "include_critical": true
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_M07",
+        "text": "synthetic post-critical turn",
+        "pad_char": "h",
+        "pad_count": 2900
+      },
+      {
+        "role": "user",
+        "marker": "TIER_A_M08",
+        "text": "synthetic later request",
+        "pad_char": "i",
+        "pad_count": 2900
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_M09",
+        "text": "synthetic later response",
+        "pad_char": "j",
+        "pad_count": 2900
+      },
+      {
+        "role": "user",
+        "marker": "TIER_A_M10",
+        "text": "synthetic closing request",
+        "pad_char": "k",
+        "pad_count": 2900
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_M11",
+        "text": "synthetic closing response",
+        "pad_char": "l",
+        "pad_count": 2900
+      }
+    ]
+  },
+  "cross_session": {
+    "session_label": "tier-a-unrelated",
+    "marker_order": [
+      "TIER_A_X00",
+      "TIER_A_X01",
+      "TIER_A_X02",
+      "TIER_A_X03",
+      "TIER_A_X04",
+      "TIER_A_X05",
+      "TIER_A_X06"
+    ],
+    "rows": [
+      {
+        "role": "system",
+        "marker": null,
+        "text": "tier-a unrelated synthetic system preamble",
+        "pad_char": "s",
+        "pad_count": 200
+      },
+      {
+        "role": "user",
+        "marker": "TIER_A_X00",
+        "text": "unrelated synthetic request",
+        "pad_char": "m",
+        "pad_count": 2900
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_X01",
+        "text": "unrelated synthetic response",
+        "pad_char": "n",
+        "pad_count": 2900
+      },
+      {
+        "role": "user",
+        "marker": "TIER_A_X02",
+        "text": "unrelated synthetic follow-up",
+        "pad_char": "o",
+        "pad_count": 2900
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_X03",
+        "text": "unrelated synthetic answer",
+        "pad_char": "p",
+        "pad_count": 2900
+      },
+      {
+        "role": "user",
+        "marker": "TIER_A_X04",
+        "text": "unrelated synthetic closing request",
+        "pad_char": "q",
+        "pad_count": 2900
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_X05",
+        "text": "unrelated synthetic closing response",
+        "pad_char": "r",
+        "pad_count": 2900
+      },
+      {
+        "role": "user",
+        "marker": "TIER_A_X06",
+        "text": "unrelated synthetic trailing request",
+        "pad_char": "t",
+        "pad_count": 2900
+      }
+    ]
+  },
+  "final_assistant_only": {
+    "session_label": "tier-a-final-assistant-only",
+    "description": "One leading user row followed by assistant-only rows, sized so the last bounded pass contains no user row. Proves the summary budget and user provenance are derived from the complete window rather than the final chunk.",
+    "marker_order": [
+      "TIER_A_F00",
+      "TIER_A_F01",
+      "TIER_A_F02",
+      "TIER_A_F03",
+      "TIER_A_F04",
+      "TIER_A_F05",
+      "TIER_A_F06"
+    ],
+    "rows": [
+      {
+        "role": "user",
+        "marker": "TIER_A_F00",
+        "text": "the only synthetic user request in this window",
+        "pad_char": "u",
+        "pad_count": 2900
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_F01",
+        "text": "assistant only follow-up one",
+        "pad_char": "v",
+        "pad_count": 2900
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_F02",
+        "text": "assistant only follow-up two",
+        "pad_char": "w",
+        "pad_count": 2900
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_F03",
+        "text": "assistant only follow-up three",
+        "pad_char": "x",
+        "pad_count": 2900
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_F04",
+        "text": "assistant only follow-up four",
+        "pad_char": "y",
+        "pad_count": 2900
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_F05",
+        "text": "assistant only follow-up five",
+        "pad_char": "z",
+        "pad_count": 2900
+      },
+      {
+        "role": "assistant",
+        "marker": "TIER_A_F06",
+        "text": "assistant only follow-up six",
+        "pad_char": "A",
+        "pad_count": 2900
+      }
+    ]
+  },
+  "oversized_row": {
+    "role": "assistant",
+    "marker": "TIER_A_OVERSIZED",
+    "text": "synthetic oversized single row that no bounded pass can hold",
+    "pad_char": "x",
+    "pad_count": 7000
+  },
+  "growth": {
+    "marker_prefix": "TIER_A_G",
+    "rows_per_cycle": 6,
+    "pad_char": "y",
+    "pad_count": 900,
+    "text": "synthetic post-compaction turn"
+  }
+}

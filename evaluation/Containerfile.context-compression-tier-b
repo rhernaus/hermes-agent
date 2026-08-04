@@ -1,0 +1,10 @@
+FROM sha256:8539546b37868ca348618a8aa147ecfb68eb0caa8e597f98e649b42ed4e5c805
+ENV UV_NO_CACHE=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/hermes/.venv \
+    VIRTUAL_ENV=/opt/hermes/.venv \
+    PATH=/opt/hermes/.venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+WORKDIR /opt/hermes
+COPY . /opt/hermes
+RUN uv sync --locked --python 3.13 --extra dev

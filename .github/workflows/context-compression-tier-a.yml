@@ -1,0 +1,237 @@
+name: Context compression Tier A
+
+# Disposable evaluation-only workflow. It runs one deterministic Tier A
+# comparison between two frozen revisions of agent/context_compressor.py and
+# publishes the evidence as an artifact plus a job summary.
+#
+# It touches no product source, calls no provider, and needs no secret. It is
+# scoped to the disposable evaluation branch and deleted with it.
+
+on:
+  pull_request:
+    branches:
+      - fix/compaction-complete-coverage
+
+permissions:
+  contents: read
+
+concurrency:
+  group: context-compression-tier-a-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tier-a:
+    # Belt and braces alongside the base-branch filter above: this evaluation
+    # only ever runs from the disposable evaluation branch.
+    if: github.head_ref == 'eval/compaction-tier-a'
+    name: Tier A comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # No provider may be reachable from this job. The evaluator drives a
+      # fake in-process provider; these are cleared so an accidental real
+      # call cannot succeed even if a code path tried one.
+      OPENROUTER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      NOUS_API_KEY: ""
+      GEMINI_API_KEY: ""
+      GOOGLE_API_KEY: ""
+      MISTRAL_API_KEY: ""
+      GROQ_API_KEY: ""
+      XAI_API_KEY: ""
+      DEEPSEEK_API_KEY: ""
+      TOGETHER_API_KEY: ""
+      FIREWORKS_API_KEY: ""
+      CEREBRAS_API_KEY: ""
+      AZURE_OPENAI_API_KEY: ""
+      HF_TOKEN: ""
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # The evaluator extracts both frozen revisions out of this clone, so
+          # it needs their objects — a shallow checkout would not have them.
+          fetch-depth: 0
+
+      - name: Seed FAIL evidence directory
+        # Written immediately after checkout, long BEFORE the evaluator is
+        # invoked, so a dependency-install failure, a syntax error, an import
+        # failure, or an early termination all still leave a machine-readable
+        # FAIL record to upload.
+        #
+        # `evidence-fail/` is WRITE-ONCE: nothing in the rest of this job ever
+        # writes into it again. Selection is directory-level — a validated
+        # finalized pair becomes a SEPARATE directory — so no later step can
+        # truncate, partially overwrite, or mix these placeholders. Choosing
+        # this directory is always a safe fail-closed outcome.
+        run: |
+          set -euo pipefail
+          mkdir -p evidence-fail
+          cat > evidence-fail/context-compression-tier-a.json <<'JSON'
+          {
+            "schema_version": "context-compression-tier-a/2",
+            "decision": {
+              "error_code": "EVALUATOR_DID_NOT_FINALIZE",
+              "failed_gates": [],
+              "increased_measures": [],
+              "rationale": "Placeholder written before the evaluator ran. The evaluator did not reach finalization, so no comparison evidence exists for this run."
+            },
+            "gates": [],
+            "overall_status": "FAIL",
+            "placeholder": true
+          }
+          JSON
+          cat > evidence-fail/context-compression-tier-a.md <<'MARKDOWN'
+          # Tier A — context compaction comparison
+
+          **Overall status: `FAIL`**
+
+          Placeholder written before the evaluator ran. The evaluator did not
+          reach finalization, so no comparison evidence exists for this run.
+          MARKDOWN
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        # Same locked install the repository's test workflow uses. The extras
+        # exercised only by the hermetic pytest environment are omitted: this
+        # job imports the compressor and nothing else.
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Minimize uv cache
+        run: uv cache prune --ci
+
+      - name: Run Tier A comparison
+        id: tier-a
+        # The evaluator stages its finalized pair in `staging/` and never
+        # touches `evidence-fail/`. Its exit code reports only whether a
+        # complete pair was finalized; the gate verdict lives inside the
+        # document and is enforced after upload.
+        run: |
+          # The default runner shell already runs with `-e`, so a non-zero
+          # exit is captured with `|| status=$?` and re-raised at the end —
+          # otherwise the shell would abort before recording the status.
+          source .venv/bin/activate
+          status=0
+          python evaluation/context_compression_tier_a.py \
+            --repo-root . \
+            --staging-dir staging || status=$?
+          echo "staging_exit=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Select finalized evidence
+        id: select
+        # Directory-level, fail-closed selection. This step NEVER writes into
+        # `evidence-fail/`; it either promotes the whole validated staging
+        # directory to `evidence-final/` with a single atomic rename, or does
+        # nothing at all. There is no copy of JSON or Markdown over the
+        # placeholders, so no interruption can truncate or mix them.
+        #
+        # `selection=finalized` is emitted as the LAST command of the step, so
+        # the output exists only when every precondition, both checksum
+        # validations, and the rename have already succeeded. An interruption
+        # before or after the rename leaves the output unset and/or the step
+        # outcome non-success, and every later path then independently falls
+        # back to the untouched FAIL directory.
+        if: always()
+        env:
+          STAGING_EXIT: ${{ steps.tier-a.outputs.staging_exit }}
+        run: |
+          set -euo pipefail
+
+          # Preconditions. A miss is a normal outcome (the evaluator crashed,
+          # or never finalized): succeed without emitting the output, which
+          # keeps the FAIL directory selected everywhere downstream.
+          if [ "${STAGING_EXIT:-}" != "0" ]; then
+            echo "Evaluator did not finalize (exit ${STAGING_EXIT:-<unset>}); retaining FAIL evidence."
+            exit 0
+          fi
+          if [ ! -f staging/FINALIZED ] || [ ! -f staging/FINALIZED.sha256 ]; then
+            echo "Finalization marker absent; retaining FAIL evidence."
+            exit 0
+          fi
+
+          # Validate the complete staged pair in place. Under `-e` any failure
+          # from here on fails the step, and because no output is emitted the
+          # untouched FAIL directory stays selected.
+          ( cd staging && sha256sum -c --status FINALIZED.sha256 )
+          test -s staging/context-compression-tier-a.json
+          test -s staging/context-compression-tier-a.md
+          python3 -c "import json; json.load(open('staging/context-compression-tier-a.json'))['overall_status']"
+
+          # Single atomic directory rename. Guarded so a pre-existing
+          # destination can never turn this into a nested move.
+          test ! -e evidence-final
+          mv staging evidence-final
+
+          # Re-validate the complete pair at its destination.
+          ( cd evidence-final && sha256sum -c --status FINALIZED.sha256 )
+
+          # FINAL command of a successful step: only now may downstream paths
+          # choose the finalized directory.
+          echo "selection=finalized" >> "$GITHUB_OUTPUT"
+
+      - name: Publish job summary
+        # Chooses its evidence independently: finalized only when the
+        # selection step SUCCEEDED and its exact output says so; otherwise the
+        # untouched FAIL directory. A missing or unreadable chosen file fails
+        # this step rather than emitting nothing.
+        if: always()
+        env:
+          EVIDENCE_DIR: ${{ (steps.select.outcome == 'success' && steps.select.outputs.selection == 'finalized') && 'evidence-final' || 'evidence-fail' }}
+        run: |
+          set -euo pipefail
+          echo "Chosen evidence directory: $EVIDENCE_DIR"
+          cat "$EVIDENCE_DIR/context-compression-tier-a.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Tier A evidence
+        # Same independent choice. `staging/` is never uploaded: if selection
+        # did not complete, that directory still exists under its original
+        # name and is deliberately not referenced here, so an unvalidated
+        # finalized document can never be published. `error` is correct
+        # because the chosen directory is guaranteed populated from the seed
+        # step onward — an empty one means the evidence guarantee itself broke.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: context-compression-tier-a-evidence
+          path: ${{ (steps.select.outcome == 'success' && steps.select.outputs.selection == 'finalized') && 'evidence-final' || 'evidence-fail' }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Enforce Tier A gate
+        # Runs after upload so the evidence is published either way, and makes
+        # the same independent choice rather than trusting a carried-forward
+        # status. Reads the verdict from the chosen machine-readable document,
+        # so a retained FAIL placeholder fails the job exactly like a real gate
+        # failure does. Missing or malformed chosen evidence fails closed.
+        if: always()
+        env:
+          EVIDENCE_DIR: ${{ (steps.select.outcome == 'success' && steps.select.outputs.selection == 'finalized') && 'evidence-final' || 'evidence-fail' }}
+        run: |
+          set -euo pipefail
+          json="$EVIDENCE_DIR/context-compression-tier-a.json"
+          test -s "$json"
+          status=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['overall_status'])" "$json")
+          case "$status" in
+            PASS|TECHNICAL_PASS_TRADEOFF_PENDING)
+              echo "Tier A gate satisfied from $EVIDENCE_DIR: $status"
+              ;;
+            *)
+              echo "Tier A gate failed from $EVIDENCE_DIR: $status"
+              exit 1
+              ;;
+          esac
