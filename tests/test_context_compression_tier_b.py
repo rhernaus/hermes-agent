@@ -398,6 +398,21 @@ esac
         )
         if cloned.returncode:
             raise AssertionError(cloned.stderr)
+        branched = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source),
+                "checkout",
+                "--quiet",
+                "-B",
+                "eval/compaction-tier-a",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if branched.returncode:
+            raise AssertionError(branched.stderr)
         approved = (
             "evaluation/context_compression_tier_b.py",
             "evaluation/fixtures/context-compression-tier-b.json",

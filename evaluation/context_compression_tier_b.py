@@ -3641,11 +3641,9 @@ def attest_runtime(
     try:
         import yaml
 
-        config = yaml.safe_load(
-            (Path(os.environ["HERMES_HOME"]) / "config.yaml").read_text(
-                encoding="utf-8"
-            )
-        )
+        from hermes_cli.config import read_user_config_raw
+
+        config = read_user_config_raw(Path(os.environ["HERMES_HOME"]) / "config.yaml")
     except (KeyError, OSError, UnicodeError, yaml.YAMLError) as exc:
         raise ValueError("RUNTIME_CONFIG_INVALID") from exc
     expected_config = {
@@ -4059,11 +4057,9 @@ def _validate_collection_config() -> None:
     try:
         import yaml
 
-        config = yaml.safe_load(
-            (Path(os.environ["HERMES_HOME"]) / "config.yaml").read_text(
-                encoding="utf-8"
-            )
-        )
+        from hermes_cli.config import read_user_config_raw
+
+        config = read_user_config_raw(Path(os.environ["HERMES_HOME"]) / "config.yaml")
     except (KeyError, OSError, UnicodeError, yaml.YAMLError) as exc:
         raise TerminalBenchmarkStop("RUNTIME_CONFIG_INVALID") from exc
     if config != {
