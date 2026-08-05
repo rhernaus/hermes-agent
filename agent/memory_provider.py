@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
@@ -129,7 +130,14 @@ class MemoryProvider(ABC):
         """
         return ""
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        deadline: Optional[float] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> str:
         """Recall relevant context for the upcoming turn.
 
         Called before each API call. Return formatted text to inject as
@@ -140,6 +148,12 @@ class MemoryProvider(ABC):
         session_id is provided for providers serving concurrent sessions
         (gateway group chats, cached agents). Providers that don't need
         per-session scoping can ignore it.
+
+        ``deadline`` is an optional absolute ``time.monotonic()`` deadline and
+        ``cancel_event`` is set when the caller no longer accepts a result.
+        They are cooperative extensions: MemoryManager passes them only when
+        an implementation declares the corresponding keyword, preserving
+        compatibility with existing providers.
         """
         return ""
 

@@ -5,11 +5,13 @@ prefetch (auto_recall, preamble, query truncation), sync_turn (auto_retain,
 turn counting, tags), and schema completeness.
 """
 
+import asyncio
 import json
 import os
 import re
 import stat
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -525,6 +527,38 @@ class TestPrefetch:
         p.queue_prefetch("anything")
         assert p._prefetch_thread is None
 
+    def test_recall_sync_cooperative_cancel_finalizes_coroutine(self, provider_with_config):
+        p = provider_with_config(recall_sync=True)
+        started = threading.Event()
+        finalized = threading.Event()
+        cancel_event = threading.Event()
+
+        async def _blocking_recall(**kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                finalized.set()
+
+        p._client.arecall = AsyncMock(side_effect=_blocking_recall)
+
+        def _cancel():
+            assert started.wait(timeout=1.0)
+            cancel_event.set()
+
+        canceller = threading.Thread(target=_cancel, daemon=True)
+        canceller.start()
+        result = p.prefetch(
+            "fix tests",
+            deadline=time.monotonic() + 1.0,
+            cancel_event=cancel_event,
+        )
+        canceller.join(timeout=1.0)
+
+        assert result == ""
+        assert finalized.is_set()
+        assert not canceller.is_alive()
+
     def test_async_default_ignores_current_query_and_reads_buffer(self, provider):
         # Default (recall_sync off): prefetch returns the buffered result and
         # does NOT issue a live recall for the current query.
@@ -862,6 +896,36 @@ class TestShutdownRace:
         # Both retains drained before shutdown returned.
         assert client.aretain_batch.call_count == 2
         assert provider._retain_queue.empty()
+
+    def test_shutdown_cancels_live_recall_and_observes_finalization(
+        self, provider_with_config
+    ):
+        provider = provider_with_config(recall_sync=True)
+        started = threading.Event()
+        finalized = threading.Event()
+
+        async def _blocking_recall(**kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                finalized.set()
+
+        provider._client.arecall = AsyncMock(side_effect=_blocking_recall)
+        result = []
+        caller = threading.Thread(
+            target=lambda: result.append(provider.prefetch("query")),
+            daemon=True,
+        )
+        caller.start()
+        assert started.wait(timeout=1.0)
+
+        provider.shutdown()
+        caller.join(timeout=1.0)
+
+        assert not caller.is_alive()
+        assert result == [""]
+        assert finalized.is_set()
 
 
 # ---------------------------------------------------------------------------

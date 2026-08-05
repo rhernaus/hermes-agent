@@ -109,6 +109,42 @@ class BlockingPrefetchProvider(FakeMemoryProvider):
         return self._prefetch_result
 
 
+class CooperativePrefetchProvider(FakeMemoryProvider):
+    """Provider that cooperatively finalizes when its turn budget expires."""
+
+    def __init__(self, name="external", *, block=False):
+        super().__init__(name=name)
+        self.block = block
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+        self.finalized = threading.Event()
+        self.deadline = None
+
+    def prefetch(
+        self,
+        query,
+        *,
+        session_id="",
+        deadline=None,
+        cancel_event=None,
+    ):
+        self.prefetch_queries.append(query)
+        self.deadline = deadline
+        self.started.set()
+        try:
+            if not self.block:
+                return self._prefetch_result
+            assert cancel_event is not None
+            cancel_event.wait(timeout=5.0)
+            if cancel_event.is_set():
+                self.cancelled.set()
+            # Deliberately return content after cancellation. The manager must
+            # discard it because this turn's deadline has already fired.
+            return self._prefetch_result
+        finally:
+            self.finalized.set()
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider ABC tests
 # ---------------------------------------------------------------------------
@@ -156,6 +192,14 @@ class TestMemoryManager:
         )
 
         assert mgr._external_prefetch_timeout == 15.0
+
+    @pytest.mark.parametrize(
+        "value",
+        [0, -1, float("nan"), float("inf"), float("-inf")],
+    )
+    def test_external_prefetch_timeout_must_be_finite_positive(self, value):
+        with pytest.raises(ValueError, match="finite and positive"):
+            MemoryManager(external_prefetch_timeout=value)
 
     def test_empty_manager(self):
         mgr = MemoryManager()
@@ -300,6 +344,64 @@ class TestMemoryManager:
 
         assert result == "builtin memory\n\nlate external memory"
         assert external.prefetch_queries == ["query", "query 3"]
+        assert external.name not in mgr._external_prefetch_threads
+
+    def test_external_prefetch_success_uses_one_turn_deadline(self):
+        mgr = MemoryManager(external_prefetch_timeout=1.0)
+        external = CooperativePrefetchProvider()
+        external._prefetch_result = "current memory"
+        mgr.add_provider(external)
+
+        started = time.monotonic()
+        result = mgr.prefetch_all("query")
+
+        assert result == "current memory"
+        assert external.deadline is not None
+        assert 0 < external.deadline - started <= 1.1
+        assert external.finalized.is_set()
+
+    def test_external_prefetch_timeout_cancels_finalizes_and_discards_late_result(self):
+        mgr = MemoryManager(external_prefetch_timeout=0.1)
+        external = CooperativePrefetchProvider(block=True)
+        external._prefetch_result = "late memory"
+        mgr.add_provider(external)
+
+        started = time.monotonic()
+        result = mgr.prefetch_all("query")
+        elapsed = time.monotonic() - started
+
+        assert result == ""
+        assert elapsed < 0.2
+        assert external.cancelled.is_set()
+        assert external.finalized.is_set()
+        assert external.name not in mgr._external_prefetch_threads
+
+        external.block = False
+        external._prefetch_result = "next-turn memory"
+        assert mgr.prefetch_all("next query") == "next-turn memory"
+
+    def test_shutdown_cancels_and_observes_active_external_prefetch(self):
+        mgr = MemoryManager(external_prefetch_timeout=5.0)
+        external = CooperativePrefetchProvider(block=True)
+        external._prefetch_result = "late memory"
+        mgr.add_provider(external)
+        result = []
+
+        caller = threading.Thread(
+            target=lambda: result.append(mgr.prefetch_all("query")),
+            daemon=True,
+        )
+        caller.start()
+        assert external.started.wait(timeout=1.0)
+
+        mgr.shutdown_all()
+        caller.join(timeout=1.0)
+
+        assert not caller.is_alive()
+        assert result == [""]
+        assert external.cancelled.is_set()
+        assert external.finalized.is_set()
+        assert external.shutdown_called is True
         assert external.name not in mgr._external_prefetch_threads
 
 

@@ -41,6 +41,8 @@ import sys
 import threading
 import time
 
+from concurrent.futures import CancelledError as FutureCancelledError
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
@@ -283,14 +285,60 @@ def _get_loop() -> asyncio.AbstractEventLoop:
         return _loop
 
 
-def _run_sync(coro, timeout: float = _DEFAULT_TIMEOUT):
-    """Schedule *coro* on the shared loop and block until done."""
+def _run_sync(
+    coro,
+    timeout: float = _DEFAULT_TIMEOUT,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+):
+    """Schedule *coro* on the shared loop and block until done.
+
+    When cooperative controls are supplied, cancellation is delivered to the
+    asyncio task and its ``finally`` completion is observed before returning,
+    bounded by the caller's absolute monotonic deadline.
+    """
     from agent.async_utils import safe_schedule_threadsafe
+
     loop = _get_loop()
-    future = safe_schedule_threadsafe(coro, loop)
+    if deadline is None and cancel_event is None:
+        future = safe_schedule_threadsafe(coro, loop)
+        if future is None:
+            raise RuntimeError("Hindsight loop unavailable")
+        return future.result(timeout=timeout)
+
+    finalized = threading.Event()
+
+    async def _run_and_observe():
+        try:
+            return await coro
+        finally:
+            finalized.set()
+
+    future = safe_schedule_threadsafe(_run_and_observe(), loop)
     if future is None:
         raise RuntimeError("Hindsight loop unavailable")
-    return future.result(timeout=timeout)
+
+    configured_deadline = time.monotonic() + float(timeout)
+    effective_deadline = min(deadline, configured_deadline) if deadline else configured_deadline
+    while True:
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        remaining = effective_deadline - time.monotonic()
+        if cancelled or remaining <= 0:
+            future.cancel()
+            finalized.wait(timeout=max(0.0, effective_deadline - time.monotonic()))
+            if not finalized.is_set():
+                logger.warning(
+                    "Hindsight recall coroutine did not finalize cancellation "
+                    "within its deadline"
+                )
+            if cancelled:
+                raise FutureCancelledError()
+            raise FutureTimeoutError()
+        try:
+            return future.result(timeout=min(0.01, remaining))
+        except FutureTimeoutError:
+            continue
 
 
 # ---------------------------------------------------------------------------
@@ -1153,9 +1201,20 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._client = Hindsight(**kwargs)
         return self._client
 
-    def _run_sync(self, coro):
+    def _run_sync(
+        self,
+        coro,
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ):
         """Schedule *coro* on the shared loop using the configured timeout."""
-        return _run_sync(coro, timeout=self._timeout)
+        return _run_sync(
+            coro,
+            timeout=self._timeout,
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
 
     def _is_retriable_embedded_connection_error(self, exc: Exception) -> bool:
         """Return True for stale embedded-daemon connection failures."""
@@ -1402,11 +1461,21 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Hindsight atexit shutdown failed: %s", exc)
 
-    def _run_hindsight_operation(self, operation):
+    def _run_hindsight_operation(
+        self,
+        operation,
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ):
         """Run an async Hindsight client operation, retrying once after idle shutdown."""
         client = self._get_client()
         try:
-            return self._run_sync(operation(client))
+            return self._run_sync(
+                operation(client),
+                deadline=deadline,
+                cancel_event=cancel_event,
+            )
         except Exception as exc:
             if not self._is_retriable_embedded_connection_error(exc):
                 raise
@@ -1417,7 +1486,11 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = None
             client = self._get_client()
             self._client = client
-            return self._run_sync(operation(client))
+            return self._run_sync(
+                operation(client),
+                deadline=deadline,
+                cancel_event=cancel_event,
+            )
 
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
@@ -1729,20 +1802,39 @@ class HindsightMemoryProvider(MemoryProvider):
             return True
         return False
 
-    def _do_recall(self, query: str) -> str:
+    def _do_recall(
+        self,
+        query: str,
+        *,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
         """Run one recall/reflect for *query* and return the formatted memory
         text (empty on error or no results).
 
         Shared by the background prefetch worker (``queue_prefetch``) and the
         opt-in synchronous path (``prefetch`` when ``recall_sync`` is enabled).
         """
+        # Every prefetch recall is shutdown-cooperative. The manager supplies a
+        # per-turn event for live recall; background recall uses the provider's
+        # own shutdown event.
+        cancel_event = cancel_event or self._shutting_down
+        if cancel_event.is_set():
+            return ""
+
         # Truncate query to max chars
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
             query = query[:self._recall_max_input_chars]
         try:
             if self._prefetch_method == "reflect":
                 logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+                resp = self._run_hindsight_operation(
+                    lambda client: client.areflect(
+                        bank_id=self._bank_id, query=query, budget=self._budget
+                    ),
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                )
                 return resp.text or ""
             recall_kwargs: dict = {
                 "bank_id": self._bank_id, "query": query,
@@ -1755,7 +1847,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 recall_kwargs["types"] = self._recall_types
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
-            resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+            resp = self._run_hindsight_operation(
+                lambda client: client.arecall(**recall_kwargs),
+                deadline=deadline,
+                cancel_event=cancel_event,
+            )
             num_results = len(resp.results) if resp.results else 0
             logger.debug("Recall: returned %d results", num_results)
             return "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
@@ -1775,14 +1871,27 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         return f"{header}\n\n{result}"
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> str:
         # Opt-in: recall synchronously against the *current* message so the
         # injected memories match this turn's query rather than the previous
         # turn's queued recall. See NousResearch/hermes-agent#5820.
         if self._recall_sync:
             if self._recall_disabled():
                 return ""
-            return self._format_recall(self._do_recall(query))
+            return self._format_recall(
+                self._do_recall(
+                    query,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                )
+            )
 
         # Default: return the result the background worker prefetched for the
         # previous turn (cheap buffer read, capped join).

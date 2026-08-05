@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import inspect
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
@@ -45,6 +47,8 @@ logger = logging.getLogger(__name__)
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+_EXTERNAL_PREFETCH_CANCEL_GRACE_S = 0.05
+_EXTERNAL_PREFETCH_SHUTDOWN_TIMEOUT_S = 1.0
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
@@ -388,9 +392,13 @@ class MemoryManager:
             if external_prefetch_timeout is None
             else float(external_prefetch_timeout)
         )
-        if self._external_prefetch_timeout <= 0:
-            raise ValueError("external_prefetch_timeout must be positive")
+        if (
+            not math.isfinite(self._external_prefetch_timeout)
+            or self._external_prefetch_timeout <= 0
+        ):
+            raise ValueError("external_prefetch_timeout must be finite and positive")
         self._external_prefetch_threads: Dict[str, threading.Thread] = {}
+        self._external_prefetch_cancel_events: Dict[str, threading.Event] = {}
         self._external_prefetch_lock = threading.Lock()
         # Background executor for end-of-turn sync/prefetch. Lazily created on
         # first use so the common builtin-only path spawns no extra threads.
@@ -542,10 +550,20 @@ class MemoryManager:
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
+        if self._shutting_down:
+            return ""
+        # One absolute deadline governs the entire external-provider fan-out
+        # for this turn. Individual providers must not restart the budget.
+        deadline = time.monotonic() + self._external_prefetch_timeout
         parts = []
         for provider in self._providers:
             try:
-                result = self._prefetch_provider(provider, clean_query, session_id=session_id)
+                result = self._prefetch_provider(
+                    provider,
+                    clean_query,
+                    session_id=session_id,
+                    deadline=deadline,
+                )
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -555,20 +573,63 @@ class MemoryManager:
                 )
         return "\n\n".join(parts)
 
+    @staticmethod
+    def _provider_prefetch_accepts_kwarg(
+        provider: MemoryProvider, keyword: str
+    ) -> bool:
+        """Return whether prefetch explicitly accepts a cooperative keyword."""
+        try:
+            signature = inspect.signature(provider.prefetch)
+        except (TypeError, ValueError):
+            return False
+        return keyword in signature.parameters or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in signature.parameters.values()
+        )
+
     def _prefetch_provider(
-        self, provider: MemoryProvider, query: str, *, session_id: str = ""
+        self,
+        provider: MemoryProvider,
+        query: str,
+        *,
+        session_id: str = "",
+        deadline: Optional[float] = None,
     ) -> str:
         if provider.name == "builtin":
             return provider.prefetch(query, session_id=session_id)
 
+        if deadline is None:
+            deadline = time.monotonic() + self._external_prefetch_timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return ""
+
         result_box: Dict[str, str] = {}
         error_box: Dict[str, Exception] = {}
+        cancel_event = threading.Event()
+        accepts_deadline = self._provider_prefetch_accepts_kwarg(
+            provider, "deadline"
+        )
+        accepts_cancel = self._provider_prefetch_accepts_kwarg(
+            provider, "cancel_event"
+        )
 
         def _run() -> None:
             try:
-                result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
+                kwargs: Dict[str, Any] = {"session_id": session_id}
+                if accepts_deadline:
+                    kwargs["deadline"] = deadline
+                if accepts_cancel:
+                    kwargs["cancel_event"] = cancel_event
+                result_box["value"] = provider.prefetch(query, **kwargs) or ""
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 error_box["value"] = exc
+            finally:
+                current = threading.current_thread()
+                with self._external_prefetch_lock:
+                    if self._external_prefetch_threads.get(provider.name) is current:
+                        self._external_prefetch_threads.pop(provider.name, None)
+                        self._external_prefetch_cancel_events.pop(provider.name, None)
 
         thread = threading.Thread(
             target=_run,
@@ -585,22 +646,45 @@ class MemoryManager:
                     )
                     return ""
                 self._external_prefetch_threads.pop(provider.name, None)
+                self._external_prefetch_cancel_events.pop(provider.name, None)
             self._external_prefetch_threads[provider.name] = thread
+            self._external_prefetch_cancel_events[provider.name] = cancel_event
             thread.start()
 
-        thread.join(self._external_prefetch_timeout)
-        if thread.is_alive():
+        timed_out = False
+        if accepts_cancel:
+            # Reserve a small slice of the same turn budget to deliver
+            # cancellation and observe cooperative coroutine finalization.
+            grace = min(
+                _EXTERNAL_PREFETCH_CANCEL_GRACE_S,
+                max(0.0, (deadline - time.monotonic()) / 2),
+            )
+            thread.join(max(0.0, deadline - time.monotonic() - grace))
+            if cancel_event.is_set():
+                timed_out = True
+            elif thread.is_alive():
+                timed_out = True
+                cancel_event.set()
+                thread.join(max(0.0, deadline - time.monotonic()))
+        else:
+            thread.join(max(0.0, deadline - time.monotonic()))
+            timed_out = thread.is_alive()
+
+        if timed_out:
             logger.warning(
-                "Memory provider '%s' prefetch timed out after %.1fs; skipping it until "
-                "the stuck call returns",
+                "Memory provider '%s' prefetch timed out after %.1fs; "
+                "discarding its result",
                 provider.name,
                 self._external_prefetch_timeout,
             )
+            if thread.is_alive() and accepts_cancel:
+                logger.warning(
+                    "Memory provider '%s' did not finalize cancellation within "
+                    "the turn budget",
+                    provider.name,
+                )
             return ""
 
-        with self._external_prefetch_lock:
-            if self._external_prefetch_threads.get(provider.name) is thread:
-                self._external_prefetch_threads.pop(provider.name, None)
         if error_box:
             raise error_box["value"]
         return result_box.get("value", "")
@@ -1161,6 +1245,8 @@ class MemoryManager:
         daemon, so anything still wedged past the drain window dies with
         the interpreter rather than blocking exit.
         """
+        self._shutting_down = True
+        self._cancel_external_prefetches()
         self._drain_sync_executor()
         for provider in reversed(self._providers):
             try:
@@ -1170,6 +1256,43 @@ class MemoryManager:
                     "Memory provider '%s' shutdown failed: %s",
                     provider.name, e,
                 )
+
+    def _cancel_external_prefetches(self) -> None:
+        """Signal and boundedly observe active per-turn provider calls."""
+        with self._external_prefetch_lock:
+            active = [
+                (
+                    name,
+                    thread,
+                    self._external_prefetch_cancel_events.get(name),
+                )
+                for name, thread in self._external_prefetch_threads.items()
+                if thread.is_alive()
+            ]
+        for _, _, cancel_event in active:
+            if cancel_event is not None:
+                cancel_event.set()
+
+        deadline = time.monotonic() + _EXTERNAL_PREFETCH_SHUTDOWN_TIMEOUT_S
+        for _, thread, _ in active:
+            thread.join(max(0.0, deadline - time.monotonic()))
+
+        still_active = []
+        with self._external_prefetch_lock:
+            for name, thread, _ in active:
+                if thread.is_alive():
+                    still_active.append(name)
+                elif self._external_prefetch_threads.get(name) is thread:
+                    self._external_prefetch_threads.pop(name, None)
+                    self._external_prefetch_cancel_events.pop(name, None)
+        if still_active:
+            logger.warning(
+                "Memory shutdown left %d non-cooperative prefetch call(s) "
+                "detached after %.1fs: %s",
+                len(still_active),
+                _EXTERNAL_PREFETCH_SHUTDOWN_TIMEOUT_S,
+                ", ".join(still_active),
+            )
 
     @property
     def shutdown_drain_state(self) -> Dict[str, Any]:
