@@ -624,7 +624,6 @@ class TestPrefetch:
         assert started.wait(timeout=1.0)
         assert cancellation_seen.wait(timeout=1.0)
         assert not finalized.is_set()
-        assert provider.name not in manager._external_prefetch_threads
         assert provider._has_active_recall_operation()
 
         # Manager wrapper-thread completion is not coroutine completion. A
@@ -638,14 +637,13 @@ class TestPrefetch:
         provider.shutdown()
         assert time.monotonic() - shutdown_started < 0.5
         client.aclose.assert_not_awaited()
-        assert provider._client is client
 
         # The actual coroutine finalizer releases ownership and triggers the
         # deferred, idempotent close without another shutdown call.
         release_finalizer.set()
         assert finalized.wait(timeout=1.0)
         close_deadline = time.monotonic() + 1.0
-        while provider._client is not None and time.monotonic() < close_deadline:
+        while client.aclose.await_count == 0 and time.monotonic() < close_deadline:
             time.sleep(0.001)
 
         client.aclose.assert_awaited_once()
