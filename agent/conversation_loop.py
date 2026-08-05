@@ -1396,8 +1396,19 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        # Codex bypasses the normal api_messages build below. Select the exact
+        # precomposed bytes stamped by turn_context so current-query memory and
+        # plugin context reach the first app-server model call. The live
+        # message retains its clean content for UI/DB display and its sidecar
+        # for byte-stable persistence/replay.
+        _codex_user_api_content = user_message
+        if 0 <= current_turn_user_idx < len(messages):
+            _sidecar = messages[current_turn_user_idx].get("api_content")
+            if isinstance(_sidecar, str) and _sidecar:
+                _codex_user_api_content = _sidecar
         return agent._run_codex_app_server_turn(
             user_message=user_message,
+            user_api_content=_codex_user_api_content,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,

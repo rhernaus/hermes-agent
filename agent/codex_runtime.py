@@ -622,6 +622,7 @@ def run_codex_app_server_turn(
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
+    user_api_content: Any = None,
     should_review_memory: bool = False,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
@@ -694,8 +695,14 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    # conversation_loop supplies the api_content sidecar stamped by
+    # turn_context. Direct callers that do not need injection preserve the
+    # legacy plain-message behavior.
+    _wire_user_input = (
+        user_message if user_api_content is None else user_api_content
+    )
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(user_input=_wire_user_input)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

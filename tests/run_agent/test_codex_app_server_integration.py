@@ -18,7 +18,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import run_agent
+from agent.turn_context import compose_user_api_content
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
+from hermes_state import SessionDB
 
 
 @pytest.fixture
@@ -85,6 +87,73 @@ class TestRunConversationCodexPath:
         assert result["api_calls"] == 1
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
+
+    def test_first_codex_call_gets_current_recall_and_persists_exact_wire_content(
+        self, monkeypatch, tmp_path
+    ):
+        captured_inputs = []
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            captured_inputs.append(user_input)
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-memory-1",
+                thread_id="thread-memory-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-memory-1"
+        )
+
+        db = SessionDB(tmp_path / "state.db")
+        agent = _make_codex_agent(
+            session_db=db,
+            session_id="codex-current-recall",
+        )
+        memory_manager = MagicMock()
+        memory_manager.prefetch_all.return_value = "current-query memory"
+        agent._memory_manager = memory_manager
+
+        with patch(
+            "hermes_cli.lifecycle.invoke_hook",
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ), patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("what matters now?")
+
+        expected = compose_user_api_content(
+            "what matters now?", "current-query memory", "PLUGIN-CTX"
+        )
+        assert expected is not None
+        assert captured_inputs == [expected]
+        memory_manager.prefetch_all.assert_called_once_with("what matters now?")
+
+        user_message = next(m for m in result["messages"] if m["role"] == "user")
+        assert user_message["content"] == "what matters now?"
+        assert user_message["api_content"] == expected
+        assert all(
+            "👁️ Hindsight" not in str(m.get("content", ""))
+            for m in result["messages"]
+        )
+
+        user_row = next(
+            row
+            for row in db.get_messages(
+                "codex-current-recall", include_inactive=True
+            )
+            if row["role"] == "user"
+        )
+        assert user_row["content"] == "what matters now?"
+        assert user_row["api_content"] == expected
+
+        replayed_user = next(
+            m
+            for m in db.get_messages_as_conversation("codex-current-recall")
+            if m["role"] == "user"
+        )
+        assert replayed_user["content"] == "what matters now?"
+        assert replayed_user["api_content"] == expected
 
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
