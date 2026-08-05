@@ -467,16 +467,35 @@ class TestToolHandlers:
 
     def test_local_embedded_recall_reconnects_after_idle_shutdown(self, provider, monkeypatch):
         first_client = _make_mock_client()
+        first_client._client = None
+        first_client.close = MagicMock()
         first_client.arecall.side_effect = RuntimeError("Cannot connect to host 127.0.0.1:8888")
         second_client = _make_mock_client()
+        second_client._client = None
+        second_client.close = MagicMock()
         second_client.arecall.return_value = SimpleNamespace(
             results=[SimpleNamespace(text="Recovered memory")]
         )
         clients = iter([first_client, second_client])
+        delayed_finalizers = []
+        run_count = 0
+
+        def _run_with_delayed_old_finalizer(coro, **kwargs):
+            nonlocal run_count
+            run_count += 1
+            on_finalized = kwargs["on_finalized"]
+            try:
+                return asyncio.run(coro)
+            finally:
+                if run_count == 1:
+                    delayed_finalizers.append(on_finalized)
+                else:
+                    on_finalized()
 
         provider._mode = "local_embedded"
         provider._client = first_client
         monkeypatch.setattr(provider, "_get_client", lambda: next(clients))
+        monkeypatch.setattr(provider, "_run_sync", _run_with_delayed_old_finalizer)
 
         result = json.loads(provider.handle_tool_call(
             "hindsight_recall", {"query": "test"}
@@ -486,6 +505,18 @@ class TestToolHandlers:
         assert provider._client is second_client
         first_client.arecall.assert_called_once()
         second_client.arecall.assert_called_once()
+
+        # The failed attempt's finalizer may run after the replacement has
+        # already succeeded. It retires only its owned client generation.
+        assert len(delayed_finalizers) == 1
+        delayed_finalizers[0]()
+        close_deadline = time.monotonic() + 1.0
+        while not first_client.close.called and time.monotonic() < close_deadline:
+            time.sleep(0.001)
+
+        first_client.close.assert_called_once()
+        second_client.close.assert_not_called()
+        assert provider._client is second_client
 
 
 # ---------------------------------------------------------------------------
@@ -945,16 +976,40 @@ class TestShutdownRace:
         assert provider._client.aretain_batch.call_count == 2
 
 
-    def test_shutdown_drains_pending_retains(self, provider):
+    def test_shutdown_drains_pending_retains(self, provider, monkeypatch):
         """Shutdown must wait for queued retains to complete, not abandon them.
 
         Otherwise the LAST in-flight turn — typically the most important —
         is silently lost.
         """
         client = provider._client
+        writer_started = threading.Event()
+        release_writer = threading.Event()
+        real_run_operation = provider._run_hindsight_operation
+
+        def _block_accepted_job(operation, **kwargs):
+            writer_started.set()
+            assert release_writer.wait(timeout=5.0)
+            return real_run_operation(operation, **kwargs)
+
+        monkeypatch.setattr(
+            provider, "_run_hindsight_operation", _block_accepted_job
+        )
         provider.sync_turn("a", "b")
         provider.sync_turn("c", "d")
-        provider.shutdown()
+        assert writer_started.wait(timeout=1.0)
+
+        shutdown_thread = threading.Thread(target=provider.shutdown, daemon=True)
+        shutdown_thread.start()
+        assert provider._shutting_down.wait(timeout=1.0)
+
+        # New external work is rejected immediately, while the two jobs that
+        # were accepted before shutdown remain eligible to drain.
+        provider.sync_turn("ignored", "after shutdown")
+        release_writer.set()
+        shutdown_thread.join(timeout=2.0)
+
+        assert not shutdown_thread.is_alive()
         # Both retains drained before shutdown returned.
         assert client.aretain_batch.call_count == 2
         assert provider._retain_queue.empty()

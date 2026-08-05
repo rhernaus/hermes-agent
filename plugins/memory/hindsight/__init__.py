@@ -784,9 +784,10 @@ class HindsightMemoryProvider(MemoryProvider):
         # cancellation-resistant asyncio operation reaches its actual
         # finalizer. Keep client ownership at the provider/coroutine boundary.
         self._client_lifecycle_lock = threading.Lock()
-        self._client_operations: Dict[object, str] = {}
+        self._client_operations: Dict[object, tuple[str, object]] = {}
         self._client_close_requested = False
-        self._client_close_started = False
+        self._clients_pending_close: List[object] = []
+        self._clients_close_started: List[object] = []
         self._timeout = _DEFAULT_TIMEOUT
         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
         self._prefetch_result = ""
@@ -797,6 +798,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # can race the interpreter shutdown and emit "cannot schedule new
         # futures after interpreter shutdown" / "Unclosed client session".
         self._retain_queue: queue.Queue = queue.Queue()
+        self._retain_admission_lock = threading.Lock()
         self._writer_thread: threading.Thread | None = None
         self._shutting_down = threading.Event()
         self._atexit_registered = False
@@ -1241,33 +1243,63 @@ class HindsightMemoryProvider(MemoryProvider):
             on_finalized=on_finalized,
         )
 
-    def _begin_client_operation(self, kind: str) -> object:
+    @staticmethod
+    def _contains_client(clients: List[object], target: object) -> bool:
+        return any(client is target for client in clients)
+
+    @staticmethod
+    def _discard_client(clients: List[object], target: object) -> None:
+        clients[:] = [client for client in clients if client is not target]
+
+    def _begin_client_operation(
+        self,
+        kind: str,
+        *,
+        accepted_before_shutdown: bool = False,
+    ) -> tuple[object, object]:
         """Claim client ownership until the scheduled coroutine finalizes."""
         with self._client_lifecycle_lock:
-            if self._shutting_down.is_set() or self._client_close_requested:
+            if (
+                (self._shutting_down.is_set() and not accepted_before_shutdown)
+                or self._client_close_requested
+            ):
                 raise RuntimeError("Hindsight provider is shutting down")
             if kind == "recall" and any(
                 active_kind == "recall"
-                for active_kind in self._client_operations.values()
+                for active_kind, _client in self._client_operations.values()
             ):
                 raise RuntimeError("Hindsight recall is already active")
+            client = self._get_client()
             token = object()
-            self._client_operations[token] = kind
-            return token
+            self._client_operations[token] = (kind, client)
+            # _get_client() normally installs the client itself. Keeping the
+            # assignment here makes reconnect ownership explicit and prevents
+            # a delayed old-client finalizer from leaving the replacement
+            # detached from the provider.
+            if self._client is None:
+                self._client = client
+            return token, client
 
     def _finish_client_operation(self, token: object) -> None:
+        client = None
         start_deferred_close = False
         with self._client_lifecycle_lock:
-            self._client_operations.pop(token, None)
+            record = self._client_operations.pop(token, None)
+            if record is not None:
+                _kind, client = record
             start_deferred_close = (
-                self._client_close_requested
-                and not self._client_operations
-                and not self._client_close_started
-                and self._client is not None
+                client is not None
+                and self._contains_client(self._clients_pending_close, client)
+                and not self._contains_client(self._clients_close_started, client)
+                and not any(
+                    operation_client is client
+                    for _kind, operation_client in self._client_operations.values()
+                )
             )
         if start_deferred_close:
             threading.Thread(
                 target=self._close_client_if_ready,
+                args=(client,),
                 daemon=True,
                 name="hindsight-deferred-close",
             ).start()
@@ -1275,7 +1307,8 @@ class HindsightMemoryProvider(MemoryProvider):
     def _has_active_recall_operation(self) -> bool:
         with self._client_lifecycle_lock:
             return any(
-                kind == "recall" for kind in self._client_operations.values()
+                kind == "recall"
+                for kind, _client in self._client_operations.values()
             )
 
     def _is_retriable_embedded_connection_error(self, exc: Exception) -> bool:
@@ -1302,9 +1335,6 @@ class HindsightMemoryProvider(MemoryProvider):
         thread = self._writer_thread
         if thread is not None and thread.is_alive():
             return
-        # If the previous writer exited (e.g. after a prior shutdown), reset
-        # the flag so this fresh writer is allowed to drain new jobs.
-        self._shutting_down.clear()
         thread = threading.Thread(
             target=self._writer_loop,
             daemon=True,
@@ -1315,6 +1345,16 @@ class HindsightMemoryProvider(MemoryProvider):
         # external code that joins _sync_thread keeps working.
         self._sync_thread = thread
         thread.start()
+
+    def _enqueue_retain_job(self, job: Callable[[], None]) -> bool:
+        """Queue one retain before shutdown publishes its FIFO sentinel."""
+        with self._retain_admission_lock:
+            if self._shutting_down.is_set():
+                return False
+            self._ensure_writer()
+            self._register_atexit()
+            self._retain_queue.put(job)
+            return True
 
     def _track_retain_ops(self, retain_response, bank_id: str) -> None:
         """Record server-side async operation id(s) from an aretain_batch reply.
@@ -1530,17 +1570,26 @@ class HindsightMemoryProvider(MemoryProvider):
         deadline: float | None = None,
         cancel_event: threading.Event | None = None,
         operation_kind: str = "client",
+        accepted_before_shutdown: bool = False,
     ):
         """Run an async Hindsight client operation, retrying once after idle shutdown."""
+        attempt_client = None
+
         def _run_once():
-            token = self._begin_client_operation(operation_kind)
+            nonlocal attempt_client
+            token = None
             try:
-                client = self._get_client()
+                token, client = self._begin_client_operation(
+                    operation_kind,
+                    accepted_before_shutdown=accepted_before_shutdown,
+                )
+                attempt_client = client
                 coro = operation(client)
             except Exception:
                 # Client/coroutine creation failed before anything could be
                 # scheduled, so no async finalizer callback can release it.
-                self._finish_client_operation(token)
+                if token is not None:
+                    self._finish_client_operation(token)
                 raise
             return self._run_sync(
                 coro,
@@ -1558,7 +1607,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 "Hindsight embedded daemon appears unreachable; recreating client and retrying once: %s",
                 exc,
             )
-            self._client = None
+            if attempt_client is not None:
+                self._retire_client(attempt_client)
             return _run_once()
 
     def _probe_url(self) -> str:
@@ -2160,7 +2210,8 @@ class HindsightMemoryProvider(MemoryProvider):
                     items=[item],
                     document_id=document_id,
                     retain_async=retain_async_flag,
-                )
+                ),
+                accepted_before_shutdown=True,
             )
             # For async retains the write is only *accepted* here; track the
             # returned operation id(s) so the next-turn prefetch can wait for
@@ -2169,9 +2220,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._track_retain_ops(resp, bank_id)
             logger.debug("Hindsight retain succeeded")
 
-        self._ensure_writer()
-        self._register_atexit()
-        self._retain_queue.put(_do_retain)
+        queued = self._enqueue_retain_job(_do_retain)
+        if not queued:
+            logger.debug("sync_turn: retain dropped (shutting down)")
+            return
         # Advance the append watermark only after the delta is queued, so a
         # later retain doesn't re-ship turns we've already handed to the writer.
         if update_mode == "append":
@@ -2346,7 +2398,8 @@ class HindsightMemoryProvider(MemoryProvider):
                             items=[item],
                             document_id=old_document_id,
                             retain_async=self._retain_async,
-                        )
+                        ),
+                        accepted_before_shutdown=True,
                     )
                 except Exception as e:
                     logger.warning("Hindsight flush-on-switch failed: %s", e, exc_info=True)
@@ -2357,10 +2410,7 @@ class HindsightMemoryProvider(MemoryProvider):
             # two threads on aretain_batch against the same document, and
             # keeps shutdown's drain semantics intact. Skip enqueue if
             # shutdown has already fired — the writer is draining/gone.
-            if not self._shutting_down.is_set():
-                self._ensure_writer()
-                self._register_atexit()
-                self._retain_queue.put(_flush)
+            self._enqueue_retain_job(_flush)
 
         # 2. Drain any in-flight prefetch from the old session and drop
         # its cached result so the new session doesn't see stale recall.
@@ -2384,18 +2434,36 @@ class HindsightMemoryProvider(MemoryProvider):
             self._session_id, self._parent_session_id, reset, self._document_id,
         )
 
-    def _close_client_if_ready(self) -> None:
-        """Close once, only after every provider-owned operation releases."""
+    def _retire_client(self, client: object) -> None:
+        """Detach and close one stale client after its own operations finish."""
+        with self._client_lifecycle_lock:
+            if self._client is client:
+                self._client = None
+            if not self._contains_client(self._clients_pending_close, client):
+                self._clients_pending_close.append(client)
+            has_operations = any(
+                operation_client is client
+                for _kind, operation_client in self._client_operations.values()
+            )
+            close_started = self._contains_client(
+                self._clients_close_started, client
+            )
+        if not has_operations and not close_started:
+            self._close_client_if_ready(client)
+
+    def _close_client_if_ready(self, client: object) -> None:
+        """Close one client only after its provider-owned operations release."""
         with self._client_lifecycle_lock:
             if (
-                not self._client_close_requested
-                or self._client_close_started
-                or self._client_operations
-                or self._client is None
+                not self._contains_client(self._clients_pending_close, client)
+                or self._contains_client(self._clients_close_started, client)
+                or any(
+                    operation_client is client
+                    for _kind, operation_client in self._client_operations.values()
+                )
             ):
                 return
-            self._client_close_started = True
-            client = self._client
+            self._clients_close_started.append(client)
 
         try:
             if self._mode == "local_embedded":
@@ -2420,33 +2488,49 @@ class HindsightMemoryProvider(MemoryProvider):
             with self._client_lifecycle_lock:
                 if self._client is client:
                     self._client = None
+                self._discard_client(self._clients_pending_close, client)
+                self._discard_client(self._clients_close_started, client)
 
     def _request_client_close(self) -> None:
         with self._client_lifecycle_lock:
             self._client_close_requested = True
-            active_count = len(self._client_operations)
+            clients: List[object] = []
+            if self._client is not None:
+                clients.append(self._client)
+            for _kind, operation_client in self._client_operations.values():
+                if (
+                    operation_client is not None
+                    and not self._contains_client(clients, operation_client)
+                ):
+                    clients.append(operation_client)
+            active_count = sum(
+                operation_client is not None
+                for _kind, operation_client in self._client_operations.values()
+            )
         if active_count:
             logger.debug(
                 "Hindsight shutdown: deferring client close for %d live operation(s)",
                 active_count,
             )
-            return
-        self._close_client_if_ready()
+        for client in clients:
+            self._retire_client(client)
 
     def shutdown(self) -> None:
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
         # Stop accepting new retain jobs first so anyone still calling
         # sync_turn() during teardown is dropped, not enqueued.
-        self._shutting_down.set()
+        with self._retain_admission_lock:
+            self._shutting_down.set()
+            writer = self._writer_thread
+            if writer is not None and writer.is_alive():
+                try:
+                    self._retain_queue.put(_WRITER_SENTINEL)
+                except Exception:
+                    pass
         # Drain the writer: it will finish in-flight work, then exit on
         # the sentinel. Bounded join keeps shutdown predictable even if
         # the daemon is wedged.
-        writer = self._writer_thread
         if writer is not None and writer.is_alive():
-            try:
-                self._retain_queue.put(_WRITER_SENTINEL)
-            except Exception:
-                pass
             writer.join(timeout=10.0)
             if writer.is_alive():
                 logger.warning(
