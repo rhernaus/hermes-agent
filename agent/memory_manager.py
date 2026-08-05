@@ -417,6 +417,9 @@ class MemoryManager:
         # a bounded FIFO drain, then explicitly report anything abandoned.
         self._background_futures: Dict[Future, str] = {}
         self._shutting_down = False
+        self._shutdown_started = False
+        self._shutdown_cleanup_started = False
+        self._shutdown_finalizer: Optional[threading.Thread] = None
         self._shutdown_drain_state: Dict[str, Any] = {
             "status": "not_started",
             "abandoned_writes": 0,
@@ -1245,23 +1248,18 @@ class MemoryManager:
     def shutdown_all(self) -> None:
         """Shut down all providers (reverse order for clean teardown).
 
-        Drains the background sync/prefetch executor first (bounded by
-        ``_SYNC_DRAIN_TIMEOUT_S``) so a turn's final sync has a chance to
-        land before providers are torn down. The worker threads are
-        daemon, so anything still wedged past the drain window dies with
-        the interpreter rather than blocking exit.
+        Durable writes accepted before shutdown keep their FIFO place. If
+        they exceed the foreground drain bound, one daemon finalizer owns
+        provider cleanup after those writes settle. Disposable prefetches
+        may be abandoned so they cannot hold up shutdown.
         """
-        self._shutting_down = True
+        with self._sync_executor_lock:
+            if self._shutdown_started:
+                return
+            self._shutdown_started = True
+            self._shutting_down = True
         self._cancel_external_prefetches()
         self._drain_sync_executor()
-        for provider in reversed(self._providers):
-            try:
-                provider.shutdown()
-            except Exception as e:
-                logger.warning(
-                    "Memory provider '%s' shutdown failed: %s",
-                    provider.name, e,
-                )
 
     def _cancel_external_prefetches(self) -> None:
         """Signal and boundedly observe active per-turn provider calls."""
@@ -1307,9 +1305,8 @@ class MemoryManager:
             return dict(self._shutdown_drain_state)
 
     def _drain_sync_executor(self) -> None:
-        """Give queued FIFO work a bounded chance, then abandon explicitly."""
+        """Bound the foreground drain without discarding accepted writes."""
         with self._sync_executor_lock:
-            self._shutting_down = True
             executor = self._sync_executor
             self._sync_executor = None
             tracked = dict(self._background_futures)
@@ -1320,46 +1317,90 @@ class MemoryManager:
                 "active_tasks": sum(not future.done() for future in tracked),
             }
         if executor is None:
+            self._finish_shutdown(None)
             return
 
-        # shutdown(wait=False) closes submission without touching the FIFO.
-        # Waiting on the tracked futures lets the real single-worker executor
-        # run every queued write/boundary task in order up to the deadline.
-        executor.shutdown(wait=False, cancel_futures=False)
-        _, pending = wait(tuple(tracked), timeout=_SYNC_DRAIN_TIMEOUT_S)
-        if not pending:
-            with self._sync_executor_lock:
-                self._shutdown_drain_state.update(status="drained", active_tasks=0)
-            return
-
-        abandoned_writes = 0
+        # Only prefetch is disposable. Cancelling a queued future removes it
+        # from the single-worker FIFO; a running one is explicitly abandoned.
         abandoned_prefetches = 0
-        active_tasks = 0
-        for future in pending:
-            kind = tracked[future]
-            if future.cancel():
-                if kind == "prefetch":
+        durable = []
+        for future, kind in tracked.items():
+            if kind == "prefetch":
+                if not future.done():
                     abandoned_prefetches += 1
-                else:
-                    abandoned_writes += 1
-            else:
-                active_tasks += 1
+                    future.cancel()
+            elif not future.done():
+                durable.append(future)
+
+        _, pending_writes = wait(tuple(durable), timeout=_SYNC_DRAIN_TIMEOUT_S)
 
         with self._sync_executor_lock:
             self._shutdown_drain_state.update(
-                status="timed_out",
-                abandoned_writes=abandoned_writes,
+                status="finalizing" if pending_writes else "drained",
+                abandoned_writes=0,
                 abandoned_prefetches=abandoned_prefetches,
-                active_tasks=active_tasks,
+                active_tasks=len(pending_writes),
             )
-        logger.warning(
-            "Memory shutdown drain timed out after %.2fs; abandoning %d queued "
-            "memory write(s) and %d queued prefetch(es); %d active task(s) remain detached",
-            _SYNC_DRAIN_TIMEOUT_S,
-            abandoned_writes,
-            abandoned_prefetches,
-            active_tasks,
-        )
+        if pending_writes:
+            logger.warning(
+                "Memory shutdown drain timed out after %.2fs; deferring provider "
+                "shutdown until %d accepted memory write(s) finish; abandoning "
+                "%d prefetch(es)",
+                _SYNC_DRAIN_TIMEOUT_S,
+                len(pending_writes),
+                abandoned_prefetches,
+            )
+            self._start_shutdown_finalizer(executor, tuple(pending_writes))
+            return
+
+        self._finish_shutdown(executor)
+
+    def _start_shutdown_finalizer(
+        self,
+        executor: ThreadPoolExecutor,
+        pending_writes: tuple[Future, ...],
+    ) -> None:
+        """Start the sole deferred owner of executor/provider teardown."""
+        with self._sync_executor_lock:
+            if self._shutdown_finalizer is not None:
+                return
+            finalizer = threading.Thread(
+                target=self._finish_shutdown_after_writes,
+                args=(executor, pending_writes),
+                daemon=True,
+                name="memory-shutdown-finalizer",
+            )
+            self._shutdown_finalizer = finalizer
+        finalizer.start()
+
+    def _finish_shutdown_after_writes(
+        self,
+        executor: ThreadPoolExecutor,
+        pending_writes: tuple[Future, ...],
+    ) -> None:
+        wait(pending_writes)
+        self._finish_shutdown(executor)
+
+    def _finish_shutdown(self, executor: Optional[ThreadPoolExecutor]) -> None:
+        """Close the executor and providers once no accepted write can race."""
+        with self._sync_executor_lock:
+            if self._shutdown_cleanup_started:
+                return
+            self._shutdown_cleanup_started = True
+
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=False)
+        for provider in reversed(self._providers):
+            try:
+                provider.shutdown()
+            except Exception as e:
+                logger.warning(
+                    "Memory provider '%s' shutdown failed: %s",
+                    provider.name, e,
+                )
+
+        with self._sync_executor_lock:
+            self._shutdown_drain_state.update(status="drained", active_tasks=0)
 
     def initialize_all(self, session_id: str, **kwargs) -> None:
         """Initialize all providers.

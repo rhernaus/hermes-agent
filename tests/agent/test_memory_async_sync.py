@@ -132,8 +132,8 @@ def test_shutdown_drains_queued_writes_and_boundary_in_fifo_order():
     assert mgr.shutdown_drain_state["abandoned_writes"] == 0
 
 
-def test_shutdown_timeout_abandons_queued_write_with_state_and_log(monkeypatch, caplog):
-    """A wedged active write bounds shutdown and reports queued data loss."""
+def test_shutdown_timeout_defers_close_until_accepted_writes_finish(monkeypatch, caplog):
+    """A bounded shutdown must leave accepted writes on the executor."""
     import agent.memory_manager as memory_manager_module
 
     started = threading.Event()
@@ -145,7 +145,10 @@ def test_shutdown_timeout_abandons_queued_write_with_state_and_log(monkeypatch, 
             if user_content == "active":
                 started.set()
                 release.wait(timeout=2)
-            calls.append(user_content)
+            calls.append(("sync", user_content))
+
+        def shutdown(self):
+            calls.append(("shutdown", None))
 
     monkeypatch.setattr(memory_manager_module, "_SYNC_DRAIN_TIMEOUT_S", 0.1)
     mgr = MemoryManager()
@@ -161,8 +164,70 @@ def test_shutdown_timeout_abandons_queued_write_with_state_and_log(monkeypatch, 
 
     state = mgr.shutdown_drain_state
     assert elapsed < 0.5
-    assert state["status"] == "timed_out"
-    assert state["abandoned_writes"] == 1
-    assert "queued" not in calls
-    assert "abandoning 1 queued memory write" in caplog.text
+    assert state["status"] == "finalizing"
+    assert state["abandoned_writes"] == 0
+    assert calls == []
+    assert "deferring provider shutdown until 2 accepted memory write" in caplog.text
+
+    finalizer = mgr._shutdown_finalizer
+    assert finalizer is not None and finalizer.is_alive()
+    mgr.shutdown_all()
+    assert mgr._shutdown_finalizer is finalizer
+
     release.set()
+    finalizer.join(timeout=1)
+
+    assert not finalizer.is_alive()
+    assert calls == [
+        ("sync", "active"),
+        ("sync", "queued"),
+        ("shutdown", None),
+    ]
+    assert mgr.shutdown_drain_state == {
+        "status": "drained",
+        "abandoned_writes": 0,
+        "abandoned_prefetches": 0,
+        "active_tasks": 0,
+    }
+
+
+def test_shutdown_cancels_queued_prefetch_but_preserves_write(monkeypatch):
+    """Disposable prefetch may be cancelled without cancelling durable work."""
+    import agent.memory_manager as memory_manager_module
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class _BlockingProvider(_SlowProvider):
+        def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+            started.set()
+            release.wait(timeout=2)
+            calls.append("write")
+
+        def queue_prefetch(self, query, *, session_id=""):
+            calls.append("prefetch")
+
+        def shutdown(self):
+            calls.append("shutdown")
+
+    monkeypatch.setattr(memory_manager_module, "_SYNC_DRAIN_TIMEOUT_S", 0.1)
+    mgr = MemoryManager()
+    mgr.add_provider(_BlockingProvider(delay=0))
+    mgr.sync_all("active", "response")
+    assert started.wait(timeout=1)
+    mgr.queue_prefetch_all("disposable")
+
+    mgr.shutdown_all()
+
+    assert mgr.shutdown_drain_state["abandoned_writes"] == 0
+    assert mgr.shutdown_drain_state["abandoned_prefetches"] == 1
+    finalizer = mgr._shutdown_finalizer
+    assert finalizer is not None
+
+    release.set()
+    finalizer.join(timeout=1)
+
+    assert not finalizer.is_alive()
+    assert calls == ["write", "shutdown"]
+    assert mgr.shutdown_drain_state["abandoned_prefetches"] == 1
