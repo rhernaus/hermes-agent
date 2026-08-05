@@ -217,6 +217,7 @@ class TestRunConversationCodexPath:
         assert user_message["content"] == rich_content
         assert user_message["api_content"] == expected
 
+        persisted_clean_text = "compare the release notes\n[screenshot]"
         user_row = next(
             row
             for row in db.get_messages(
@@ -224,7 +225,7 @@ class TestRunConversationCodexPath:
             )
             if row["role"] == "user"
         )
-        assert user_row["content"] == rich_content
+        assert user_row["content"] == persisted_clean_text
         assert user_row["api_content"] == expected
 
         replayed_user = next(
@@ -234,7 +235,7 @@ class TestRunConversationCodexPath:
             )
             if m["role"] == "user"
         )
-        assert replayed_user["content"] == rich_content
+        assert replayed_user["content"] == persisted_clean_text
         assert replayed_user["api_content"] == expected
 
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
