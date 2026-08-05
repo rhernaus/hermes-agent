@@ -193,6 +193,11 @@ class TestMemoryManager:
 
         assert mgr._external_prefetch_timeout == 15.0
 
+    def test_external_prefetch_timeout_accepts_documented_maximum(self):
+        mgr = MemoryManager(external_prefetch_timeout=120)
+
+        assert mgr._external_prefetch_timeout == 120.0
+
     @pytest.mark.parametrize(
         "value",
         [0, -1, float("nan"), float("inf"), float("-inf")],
@@ -200,6 +205,10 @@ class TestMemoryManager:
     def test_external_prefetch_timeout_must_be_finite_positive(self, value):
         with pytest.raises(ValueError, match="finite and positive"):
             MemoryManager(external_prefetch_timeout=value)
+
+    def test_external_prefetch_timeout_rejects_values_above_sane_maximum(self):
+        with pytest.raises(ValueError, match="at most 120"):
+            MemoryManager(external_prefetch_timeout=120.01)
 
     def test_empty_manager(self):
         mgr = MemoryManager()

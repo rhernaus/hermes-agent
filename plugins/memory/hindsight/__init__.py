@@ -44,7 +44,7 @@ import time
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 from agent.secret_scope import get_secret
 
@@ -291,6 +291,7 @@ def _run_sync(
     *,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
+    on_finalized: Callable[[], None] | None = None,
 ):
     """Schedule *coro* on the shared loop and block until done.
 
@@ -301,7 +302,7 @@ def _run_sync(
     from agent.async_utils import safe_schedule_threadsafe
 
     loop = _get_loop()
-    if deadline is None and cancel_event is None:
+    if deadline is None and cancel_event is None and on_finalized is None:
         future = safe_schedule_threadsafe(coro, loop)
         if future is None:
             raise RuntimeError("Hindsight loop unavailable")
@@ -309,14 +310,29 @@ def _run_sync(
 
     finalized = threading.Event()
 
+    def _notify_owner() -> None:
+        if on_finalized is None:
+            return
+        try:
+            on_finalized()
+        except Exception:
+            logger.debug("Hindsight operation finalizer callback failed", exc_info=True)
+
     async def _run_and_observe():
         try:
             return await coro
         finally:
             finalized.set()
+            if on_finalized is not None:
+                # Release provider ownership on the next loop tick, after this
+                # wrapper and the awaited coroutine's own finalizer complete.
+                asyncio.get_running_loop().call_soon(_notify_owner)
 
     future = safe_schedule_threadsafe(_run_and_observe(), loop)
     if future is None:
+        if asyncio.iscoroutine(coro):
+            coro.close()
+        _notify_owner()
         raise RuntimeError("Hindsight loop unavailable")
 
     configured_deadline = time.monotonic() + float(timeout)
@@ -764,6 +780,13 @@ class HindsightMemoryProvider(MemoryProvider):
         self._agent_workspace = ""
         self._turn_index = 0
         self._client = None
+        # The manager's synchronous wrapper thread can finish before a
+        # cancellation-resistant asyncio operation reaches its actual
+        # finalizer. Keep client ownership at the provider/coroutine boundary.
+        self._client_lifecycle_lock = threading.Lock()
+        self._client_operations: Dict[object, str] = {}
+        self._client_close_requested = False
+        self._client_close_started = False
         self._timeout = _DEFAULT_TIMEOUT
         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
         self._prefetch_result = ""
@@ -1207,6 +1230,7 @@ class HindsightMemoryProvider(MemoryProvider):
         *,
         deadline: float | None = None,
         cancel_event: threading.Event | None = None,
+        on_finalized: Callable[[], None] | None = None,
     ):
         """Schedule *coro* on the shared loop using the configured timeout."""
         return _run_sync(
@@ -1214,7 +1238,45 @@ class HindsightMemoryProvider(MemoryProvider):
             timeout=self._timeout,
             deadline=deadline,
             cancel_event=cancel_event,
+            on_finalized=on_finalized,
         )
+
+    def _begin_client_operation(self, kind: str) -> object:
+        """Claim client ownership until the scheduled coroutine finalizes."""
+        with self._client_lifecycle_lock:
+            if self._shutting_down.is_set() or self._client_close_requested:
+                raise RuntimeError("Hindsight provider is shutting down")
+            if kind == "recall" and any(
+                active_kind == "recall"
+                for active_kind in self._client_operations.values()
+            ):
+                raise RuntimeError("Hindsight recall is already active")
+            token = object()
+            self._client_operations[token] = kind
+            return token
+
+    def _finish_client_operation(self, token: object) -> None:
+        start_deferred_close = False
+        with self._client_lifecycle_lock:
+            self._client_operations.pop(token, None)
+            start_deferred_close = (
+                self._client_close_requested
+                and not self._client_operations
+                and not self._client_close_started
+                and self._client is not None
+            )
+        if start_deferred_close:
+            threading.Thread(
+                target=self._close_client_if_ready,
+                daemon=True,
+                name="hindsight-deferred-close",
+            ).start()
+
+    def _has_active_recall_operation(self) -> bool:
+        with self._client_lifecycle_lock:
+            return any(
+                kind == "recall" for kind in self._client_operations.values()
+            )
 
     def _is_retriable_embedded_connection_error(self, exc: Exception) -> bool:
         """Return True for stale embedded-daemon connection failures."""
@@ -1467,15 +1529,28 @@ class HindsightMemoryProvider(MemoryProvider):
         *,
         deadline: float | None = None,
         cancel_event: threading.Event | None = None,
+        operation_kind: str = "client",
     ):
         """Run an async Hindsight client operation, retrying once after idle shutdown."""
-        client = self._get_client()
-        try:
+        def _run_once():
+            token = self._begin_client_operation(operation_kind)
+            try:
+                client = self._get_client()
+                coro = operation(client)
+            except Exception:
+                # Client/coroutine creation failed before anything could be
+                # scheduled, so no async finalizer callback can release it.
+                self._finish_client_operation(token)
+                raise
             return self._run_sync(
-                operation(client),
+                coro,
                 deadline=deadline,
                 cancel_event=cancel_event,
+                on_finalized=lambda: self._finish_client_operation(token),
             )
+
+        try:
+            return _run_once()
         except Exception as exc:
             if not self._is_retriable_embedded_connection_error(exc):
                 raise
@@ -1484,13 +1559,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 exc,
             )
             self._client = None
-            client = self._get_client()
-            self._client = client
-            return self._run_sync(
-                operation(client),
-                deadline=deadline,
-                cancel_event=cancel_event,
-            )
+            return _run_once()
 
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
@@ -1834,6 +1903,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     ),
                     deadline=deadline,
                     cancel_event=cancel_event,
+                    operation_kind="recall",
                 )
                 return resp.text or ""
             recall_kwargs: dict = {
@@ -1851,6 +1921,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 lambda client: client.arecall(**recall_kwargs),
                 deadline=deadline,
                 cancel_event=cancel_event,
+                operation_kind="recall",
             )
             num_results = len(resp.results) if resp.results else 0
             logger.debug("Recall: returned %d results", num_results)
@@ -1884,6 +1955,9 @@ class HindsightMemoryProvider(MemoryProvider):
         # turn's queued recall. See NousResearch/hermes-agent#5820.
         if self._recall_sync:
             if self._recall_disabled():
+                return ""
+            if self._has_active_recall_operation():
+                logger.debug("Prefetch: live recall is still finalizing; skipping")
                 return ""
             return self._format_recall(
                 self._do_recall(
@@ -2310,6 +2384,55 @@ class HindsightMemoryProvider(MemoryProvider):
             self._session_id, self._parent_session_id, reset, self._document_id,
         )
 
+    def _close_client_if_ready(self) -> None:
+        """Close once, only after every provider-owned operation releases."""
+        with self._client_lifecycle_lock:
+            if (
+                not self._client_close_requested
+                or self._client_close_started
+                or self._client_operations
+                or self._client is None
+            ):
+                return
+            self._client_close_started = True
+            client = self._client
+
+        try:
+            if self._mode == "local_embedded":
+                # Close the inner async client on its owning shared loop before
+                # the embedded wrapper performs daemon/UI bookkeeping.
+                inner_client = getattr(client, "_client", None)
+                if inner_client is not None and hasattr(inner_client, "aclose"):
+                    _run_sync(inner_client.aclose())
+                    try:
+                        client._client = None
+                    except Exception:
+                        pass
+                try:
+                    client.close()
+                except RuntimeError:
+                    pass
+            else:
+                _run_sync(client.aclose(), timeout=self._timeout)
+        except Exception:
+            pass
+        finally:
+            with self._client_lifecycle_lock:
+                if self._client is client:
+                    self._client = None
+
+    def _request_client_close(self) -> None:
+        with self._client_lifecycle_lock:
+            self._client_close_requested = True
+            active_count = len(self._client_operations)
+        if active_count:
+            logger.debug(
+                "Hindsight shutdown: deferring client close for %d live operation(s)",
+                active_count,
+            )
+            return
+        self._close_client_if_ready()
+
     def shutdown(self) -> None:
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
         # Stop accepting new retain jobs first so anyone still calling
@@ -2333,31 +2456,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 )
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=5.0)
-        if self._client is not None:
-            try:
-                if self._mode == "local_embedded":
-                    # HindsightEmbedded.close() delegates to its sync client.close().
-                    # When Hermes created/used that client on the shared async loop,
-                    # closing it from this thread can raise "attached to a different
-                    # loop" before aiohttp releases the session. Close the embedded
-                    # inner async client on the shared loop first, then let the
-                    # wrapper clean up daemon/UI bookkeeping.
-                    inner_client = getattr(self._client, "_client", None)
-                    if inner_client is not None and hasattr(inner_client, "aclose"):
-                        _run_sync(inner_client.aclose())
-                        try:
-                            self._client._client = None
-                        except Exception:
-                            pass
-                    try:
-                        self._client.close()
-                    except RuntimeError:
-                        pass
-                else:
-                    self._run_sync(self._client.aclose())
-            except Exception:
-                pass
-            self._client = None
+        self._request_client_close()
         # The module-global background event loop (_loop / _loop_thread)
         # is intentionally NOT stopped here. It is shared across every
         # HindsightMemoryProvider instance in the process — the plugin

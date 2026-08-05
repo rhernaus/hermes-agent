@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+_EXTERNAL_PREFETCH_TIMEOUT_MAX_S = 120.0
 _EXTERNAL_PREFETCH_CANCEL_GRACE_S = 0.05
 _EXTERNAL_PREFETCH_SHUTDOWN_TIMEOUT_S = 1.0
 
@@ -397,6 +398,11 @@ class MemoryManager:
             or self._external_prefetch_timeout <= 0
         ):
             raise ValueError("external_prefetch_timeout must be finite and positive")
+        if self._external_prefetch_timeout > _EXTERNAL_PREFETCH_TIMEOUT_MAX_S:
+            raise ValueError(
+                "external_prefetch_timeout must be at most "
+                f"{_EXTERNAL_PREFETCH_TIMEOUT_MAX_S:g} seconds"
+            )
         self._external_prefetch_threads: Dict[str, threading.Thread] = {}
         self._external_prefetch_cancel_events: Dict[str, threading.Event] = {}
         self._external_prefetch_lock = threading.Lock()

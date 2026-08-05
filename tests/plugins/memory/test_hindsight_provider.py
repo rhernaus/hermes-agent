@@ -559,6 +559,68 @@ class TestPrefetch:
         assert finalized.is_set()
         assert not canceller.is_alive()
 
+    def test_cancellation_resistant_recall_retains_ownership_until_late_finalizer(
+        self, provider_with_config
+    ):
+        from agent.memory_manager import MemoryManager
+
+        provider = provider_with_config(recall_sync=True)
+        client = provider._client
+        started = threading.Event()
+        cancellation_seen = threading.Event()
+        release_finalizer = threading.Event()
+        finalized = threading.Event()
+
+        async def _cancellation_resistant_recall(**kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                while not release_finalizer.is_set():
+                    await asyncio.sleep(0.001)
+            finally:
+                finalized.set()
+            return SimpleNamespace(results=[])
+
+        client.arecall = AsyncMock(side_effect=_cancellation_resistant_recall)
+        manager = MemoryManager(external_prefetch_timeout=0.05)
+        manager.add_provider(provider)
+
+        started_at = time.monotonic()
+        assert manager.prefetch_all("first current query") == ""
+        assert time.monotonic() - started_at < 0.5
+        assert started.wait(timeout=1.0)
+        assert cancellation_seen.wait(timeout=1.0)
+        assert not finalized.is_set()
+        assert provider.name not in manager._external_prefetch_threads
+        assert provider._has_active_recall_operation()
+
+        # Manager wrapper-thread completion is not coroutine completion. A
+        # second turn must not start a duplicate live recall while the first
+        # coroutine still owns the client.
+        assert manager.prefetch_all("second current query") == ""
+        assert client.arecall.await_count == 1
+
+        # Shutdown is finite and must defer close while that ownership is live.
+        shutdown_started = time.monotonic()
+        provider.shutdown()
+        assert time.monotonic() - shutdown_started < 0.5
+        client.aclose.assert_not_awaited()
+        assert provider._client is client
+
+        # The actual coroutine finalizer releases ownership and triggers the
+        # deferred, idempotent close without another shutdown call.
+        release_finalizer.set()
+        assert finalized.wait(timeout=1.0)
+        close_deadline = time.monotonic() + 1.0
+        while provider._client is not None and time.monotonic() < close_deadline:
+            time.sleep(0.001)
+
+        client.aclose.assert_awaited_once()
+        assert provider._client is None
+        assert not provider._has_active_recall_operation()
+
     def test_async_default_ignores_current_query_and_reads_buffer(self, provider):
         # Default (recall_sync off): prefetch returns the buffered result and
         # does NOT issue a live recall for the current query.
