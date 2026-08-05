@@ -1012,6 +1012,67 @@ class TestShutdownRace:
         assert client.aretain_batch.call_count == 2
         assert provider._retain_queue.empty()
 
+    def test_shutdown_timeout_defers_close_until_writer_drains(
+        self, provider, monkeypatch
+    ):
+        """A timed-out foreground join must leave the FIFO writer in charge."""
+        client = provider._client
+        writer_started = threading.Event()
+        release_writer = threading.Event()
+        real_run_operation = provider._run_hindsight_operation
+
+        def _block_first_accepted_job(operation, **kwargs):
+            if not writer_started.is_set():
+                writer_started.set()
+                assert release_writer.wait(timeout=5.0)
+            return real_run_operation(operation, **kwargs)
+
+        monkeypatch.setattr(
+            provider, "_run_hindsight_operation", _block_first_accepted_job
+        )
+        provider.sync_turn("first", "response")
+        provider.sync_turn("second", "response")
+        assert writer_started.wait(timeout=1.0)
+
+        join_calls = []
+
+        def _report_foreground_timeout(writer, timeout):
+            join_calls.append((writer, timeout))
+            return False
+
+        monkeypatch.setattr(
+            provider, "_join_writer_for_shutdown", _report_foreground_timeout
+        )
+
+        started_at = time.monotonic()
+        provider.shutdown()
+        assert time.monotonic() - started_at < 0.5
+
+        writer = provider._writer_thread
+        assert join_calls == [(writer, 10.0)]
+        assert provider._client_close_requested is False
+        client.aclose.assert_not_awaited()
+        finalizer = provider._shutdown_finalizer
+        assert finalizer is not None and finalizer.is_alive()
+
+        queued_before_repeat = provider._retain_queue.qsize()
+        provider.shutdown()
+        provider.sync_turn("ignored", "after shutdown")
+        assert provider._shutdown_finalizer is finalizer
+        assert provider._retain_queue.qsize() == queued_before_repeat
+        assert provider._client_close_requested is False
+
+        release_writer.set()
+        finalizer.join(timeout=2.0)
+
+        assert not finalizer.is_alive()
+        assert writer is not None and not writer.is_alive()
+        assert client.aretain_batch.call_count == 2
+        client.aclose.assert_awaited_once()
+        assert provider._client is None
+        assert provider._client_close_requested is True
+        assert provider._retain_queue.empty()
+
     def test_shutdown_cancels_live_recall_and_observes_finalization(
         self, provider_with_config
     ):

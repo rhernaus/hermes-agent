@@ -801,6 +801,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._retain_admission_lock = threading.Lock()
         self._writer_thread: threading.Thread | None = None
         self._shutting_down = threading.Event()
+        self._shutdown_started = False
+        self._shutdown_finalizer: threading.Thread | None = None
         self._atexit_registered = False
         # Server-side async retain operations still in flight. With
         # retain_async=True, aretain_batch returns as soon as the write is
@@ -1529,8 +1531,6 @@ class HindsightMemoryProvider(MemoryProvider):
             try:
                 job = self._retain_queue.get(timeout=1.0)
             except queue.Empty:
-                if self._shutting_down.is_set():
-                    return
                 continue
             try:
                 if job is _WRITER_SENTINEL:
@@ -2493,6 +2493,8 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _request_client_close(self) -> None:
         with self._client_lifecycle_lock:
+            if self._client_close_requested:
+                return
             self._client_close_requested = True
             clients: List[object] = []
             if self._client is not None:
@@ -2515,11 +2517,39 @@ class HindsightMemoryProvider(MemoryProvider):
         for client in clients:
             self._retire_client(client)
 
+    def _join_writer_for_shutdown(
+        self, writer: threading.Thread, timeout: float
+    ) -> bool:
+        """Bound the public shutdown wait; kept as a deterministic test seam."""
+        writer.join(timeout=timeout)
+        return not writer.is_alive()
+
+    def _start_shutdown_finalizer(self, writer: threading.Thread) -> None:
+        """Start the sole deferred owner of client-close admission."""
+        with self._retain_admission_lock:
+            if self._shutdown_finalizer is not None:
+                return
+            finalizer = threading.Thread(
+                target=self._finish_shutdown_after_writer,
+                args=(writer,),
+                daemon=True,
+                name="hindsight-shutdown-finalizer",
+            )
+            self._shutdown_finalizer = finalizer
+        finalizer.start()
+
+    def _finish_shutdown_after_writer(self, writer: threading.Thread) -> None:
+        writer.join()
+        self._request_client_close()
+
     def shutdown(self) -> None:
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
         # Stop accepting new retain jobs first so anyone still calling
         # sync_turn() during teardown is dropped, not enqueued.
         with self._retain_admission_lock:
+            if self._shutdown_started:
+                return
+            self._shutdown_started = True
             self._shutting_down.set()
             writer = self._writer_thread
             if writer is not None and writer.is_alive():
@@ -2530,17 +2560,21 @@ class HindsightMemoryProvider(MemoryProvider):
         # Drain the writer: it will finish in-flight work, then exit on
         # the sentinel. Bounded join keeps shutdown predictable even if
         # the daemon is wedged.
+        writer_exited = True
         if writer is not None and writer.is_alive():
-            writer.join(timeout=10.0)
-            if writer.is_alive():
+            writer_exited = self._join_writer_for_shutdown(writer, 10.0)
+            if not writer_exited:
                 logger.warning(
                     "Hindsight writer did not stop within 10s; "
-                    "abandoning %d pending retain(s)",
+                    "deferring client close while %d accepted retain(s) drain",
                     self._retain_queue.qsize(),
                 )
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=5.0)
-        self._request_client_close()
+        if writer_exited:
+            self._request_client_close()
+        else:
+            self._start_shutdown_finalizer(writer)
         # The module-global background event loop (_loop / _loop_thread)
         # is intentionally NOT stopped here. It is shared across every
         # HindsightMemoryProvider instance in the process — the plugin
