@@ -1234,10 +1234,11 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
         if _active_agent_ref and hasattr(_active_agent_ref, 'shutdown_memory_provider'):
             # A /new shortly before exit leaves its end→switch boundary task
             # (old-session extraction, LLM-bound) queued on the memory
-            # manager's serialized worker. shutdown_all()'s drain only waits
-            # ~5s and cancels queued tasks, so give pending work a bounded
-            # head start via the manager's own barrier — otherwise a
-            # "/new then quit" silently drops the old session's extraction.
+            # manager's serialized worker. shutdown_all() returns after a ~5s
+            # foreground drain, while timed-out accepted writes remain owned
+            # by a deferred durable-write drain. Give pending work a bounded
+            # head start via the manager's own barrier so a "/new then quit"
+            # has more time to persist the old session's extraction.
             # The 30s exit watchdog remains the hard backstop.
             _mm = getattr(_active_agent_ref, '_memory_manager', None)
             if _mm is not None and hasattr(_mm, 'flush_pending'):

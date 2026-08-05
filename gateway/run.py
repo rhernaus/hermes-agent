@@ -9523,15 +9523,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Drain queued memory writes BEFORE tearing the provider down.
                 # The memory manager persists per-turn sync and end-of-session
                 # extraction on a single serialized background worker.
-                # shutdown_memory_provider() -> shutdown_all() only gives that
-                # worker a ~5s bounded drain and abandons (cancels) anything
-                # still queued past it, so a /reset — or any gateway session
-                # rotation that reaches this cleanup path — could silently drop
-                # writes the session had already handed off. The next session
-                # then loads stale memory (#73297). Give pending work a bounded
-                # head start through the manager's own barrier first, mirroring
-                # the CLI exit path (cli.py). Best-effort: a flush failure must
-                # never block teardown.
+                # shutdown_memory_provider() -> shutdown_all() gives that
+                # worker a ~5s foreground drain; timed-out accepted writes keep
+                # their FIFO place and finish under a deferred durable-write
+                # drain. Give pending work a bounded head start through the
+                # manager's own barrier first, mirroring the CLI exit path
+                # (cli.py), so session rotation is less likely to observe stale
+                # memory (#73297). Best-effort: a flush failure must never block
+                # teardown.
                 _mm = getattr(agent, "_memory_manager", None)
                 if _mm is not None and hasattr(_mm, "flush_pending"):
                     try:

@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -92,6 +92,54 @@ def _make_mock_client():
     client.aretain_batch = AsyncMock()
     client.aclose = AsyncMock()
     return client
+
+
+def _prepare_embedded_daemon_worker(provider, tmp_path, monkeypatch):
+    """Install deterministic local-daemon seams without a real runtime."""
+    provider._mode = "local_embedded"
+    provider._config = {"profile": "hermes"}
+    monkeypatch.setattr(
+        "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+    )
+    profile_env = tmp_path / "hermes.env"
+    expected_env = {"SETTING": "current"}
+    monkeypatch.setattr(
+        "plugins.memory.hindsight._embedded_profile_env_path",
+        lambda config: profile_env,
+    )
+    monkeypatch.setattr(
+        "plugins.memory.hindsight._build_embedded_profile_env",
+        lambda config: expected_env,
+    )
+    monkeypatch.setattr(
+        "plugins.memory.hindsight._load_simple_env",
+        lambda path: expected_env,
+    )
+
+    daemon_manager = ModuleType("hindsight_embed.daemon_embed_manager")
+    daemon_manager.console = None
+    hindsight_embed = ModuleType("hindsight_embed")
+    hindsight_embed.__path__ = []
+    hindsight_embed.daemon_embed_manager = daemon_manager
+    monkeypatch.setitem(sys.modules, "hindsight_embed", hindsight_embed)
+    monkeypatch.setitem(
+        sys.modules,
+        "hindsight_embed.daemon_embed_manager",
+        daemon_manager,
+    )
+
+    console_module = ModuleType("rich.console")
+
+    def _console(*, file, force_terminal):
+        file.close()
+        return SimpleNamespace(force_terminal=force_terminal)
+
+    console_module.Console = _console
+    rich = ModuleType("rich")
+    rich.__path__ = []
+    rich.console = console_module
+    monkeypatch.setitem(sys.modules, "rich", rich)
+    monkeypatch.setitem(sys.modules, "rich.console", console_module)
 
 
 def _provider_for_mode(tmp_path, monkeypatch, mode: str):
@@ -959,6 +1007,176 @@ class TestSyncTurn:
 
 
 class TestShutdownRace:
+    def test_daemon_start_shutdown_before_admission_creates_no_client(
+        self, tmp_path, monkeypatch
+    ):
+        provider = HindsightMemoryProvider()
+        provider._mode = "local_embedded"
+        provider._config = {"profile": "hermes"}
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+        )
+        get_client = MagicMock(
+            side_effect=AssertionError("shutdown must reject before client creation")
+        )
+        monkeypatch.setattr(provider, "_get_client", get_client)
+
+        provider.shutdown()
+        provider._start_local_daemon_background()
+
+        get_client.assert_not_called()
+        assert provider._client is None
+        assert provider._client_operations == {}
+
+    def test_daemon_start_shutdown_defers_close_until_finalizer_releases(
+        self, tmp_path, monkeypatch
+    ):
+        provider = HindsightMemoryProvider()
+        _prepare_embedded_daemon_worker(provider, tmp_path, monkeypatch)
+        ensure_started = threading.Event()
+        release_ensure = threading.Event()
+        closed = threading.Event()
+
+        client = MagicMock()
+        client._client = None
+        client._manager.is_running.return_value = False
+
+        def _ensure_started():
+            ensure_started.set()
+            assert release_ensure.wait(timeout=5.0)
+
+        client._ensure_started.side_effect = _ensure_started
+        client.close.side_effect = closed.set
+        provider._client = client
+
+        daemon_thread = threading.Thread(
+            target=provider._start_local_daemon_background,
+            daemon=True,
+        )
+        daemon_thread.start()
+        assert ensure_started.wait(timeout=1.0)
+
+        started_at = time.monotonic()
+        provider.shutdown()
+        assert time.monotonic() - started_at < 0.5
+        client.close.assert_not_called()
+        assert provider._client is None
+        assert any(
+            kind == "daemon_start" and operation_client is client
+            for kind, operation_client in provider._client_operations.values()
+        )
+
+        release_ensure.set()
+        daemon_thread.join(timeout=1.0)
+        assert not daemon_thread.is_alive()
+        assert closed.wait(timeout=1.0)
+
+        client._ensure_started.assert_called_once_with()
+        client.close.assert_called_once_with()
+        assert provider._client_operations == {}
+
+    def test_daemon_start_and_recall_share_one_tracked_client_generation(
+        self, tmp_path, monkeypatch
+    ):
+        provider = HindsightMemoryProvider()
+        _prepare_embedded_daemon_worker(provider, tmp_path, monkeypatch)
+        first_creation_started = threading.Event()
+        release_first_creation = threading.Event()
+        ensure_started = threading.Event()
+        release_ensure = threading.Event()
+        recall_acquired = threading.Event()
+        release_recall = threading.Event()
+        second_lock_attempted = threading.Event()
+        created_clients = []
+        recall_clients = []
+
+        class _ObservedLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._attempt_lock = threading.Lock()
+                self._attempts = 0
+
+            def __enter__(self):
+                with self._attempt_lock:
+                    self._attempts += 1
+                    if self._attempts == 2:
+                        second_lock_attempted.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self._lock.release()
+
+        provider._client_lifecycle_lock = _ObservedLock()
+
+        first_client = MagicMock()
+        first_client._client = None
+        first_client._manager.is_running.return_value = False
+
+        def _ensure_started():
+            ensure_started.set()
+            assert release_ensure.wait(timeout=5.0)
+
+        first_client._ensure_started.side_effect = _ensure_started
+
+        def _get_client():
+            if provider._client is not None:
+                return provider._client
+            generation = MagicMock() if created_clients else first_client
+            created_clients.append(generation)
+            if len(created_clients) == 1:
+                first_creation_started.set()
+                assert release_first_creation.wait(timeout=5.0)
+            provider._client = generation
+            return generation
+
+        monkeypatch.setattr(provider, "_get_client", _get_client)
+
+        daemon_thread = threading.Thread(
+            target=provider._start_local_daemon_background,
+            daemon=True,
+        )
+        daemon_thread.start()
+        assert first_creation_started.wait(timeout=1.0)
+
+        def _claim_recall():
+            token, client = provider._begin_client_operation("recall")
+            try:
+                recall_clients.append(client)
+                recall_acquired.set()
+                assert release_recall.wait(timeout=5.0)
+            finally:
+                provider._finish_client_operation(token)
+
+        recall_thread = threading.Thread(target=_claim_recall, daemon=True)
+        recall_thread.start()
+        assert second_lock_attempted.wait(timeout=1.0)
+        assert not recall_acquired.is_set()
+
+        release_first_creation.set()
+        assert ensure_started.wait(timeout=1.0)
+        assert recall_acquired.wait(timeout=1.0)
+
+        assert created_clients == [first_client]
+        assert recall_clients == [first_client]
+        assert {
+            kind for kind, _client in provider._client_operations.values()
+        } == {"daemon_start", "recall"}
+        assert all(
+            operation_client is first_client
+            for _kind, operation_client in provider._client_operations.values()
+        )
+
+        release_recall.set()
+        release_ensure.set()
+        recall_thread.join(timeout=1.0)
+        daemon_thread.join(timeout=1.0)
+
+        assert not recall_thread.is_alive()
+        assert not daemon_thread.is_alive()
+        assert provider._client is first_client
+        assert provider._client_operations == {}
+
     def test_sync_turn_uses_single_writer_thread(self, provider):
         """All retains run through one long-lived writer thread."""
         provider.sync_turn("a", "b")

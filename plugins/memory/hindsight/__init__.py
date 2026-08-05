@@ -1645,6 +1645,72 @@ class HindsightMemoryProvider(MemoryProvider):
             return self._session_id, "append"
         return fallback_document_id, None
 
+    def _start_local_daemon_background(self) -> None:
+        """Start the embedded daemon while owning its client generation."""
+        import traceback
+
+        token = None
+        log_path = None
+        try:
+            token, client = self._begin_client_operation("daemon_start")
+
+            log_dir = get_hermes_home() / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "hindsight-embed.log"
+
+            # Redirect the daemon manager's Rich console to our log file
+            # instead of stderr. This avoids global fd redirects that
+            # would capture output from other threads.
+            import hindsight_embed.daemon_embed_manager as dem
+            from rich.console import Console
+            dem.console = Console(file=open(log_path, "a", encoding="utf-8"), force_terminal=False)
+
+            profile = self._config.get("profile", "hermes")
+
+            # Update the profile .env to match our current config so
+            # the daemon always starts with the right settings.
+            # If the config changed and the daemon is running, stop it.
+            profile_env = _embedded_profile_env_path(self._config)
+            expected_env = _build_embedded_profile_env(self._config)
+            saved = _load_simple_env(profile_env)
+            config_changed = saved != expected_env
+
+            if config_changed:
+                profile_env = _materialize_embedded_profile_env(self._config)
+                if client._manager.is_running(profile):
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write("\n=== Config changed, restarting daemon ===\n")
+                    client._manager.stop(profile)
+
+            client._ensure_started()
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write("\n=== Daemon started successfully ===\n")
+        except Exception as e:
+            if token is None:
+                with self._client_lifecycle_lock:
+                    admission_closed = (
+                        self._shutting_down.is_set()
+                        or self._client_close_requested
+                    )
+                if admission_closed:
+                    logger.debug(
+                        "Hindsight daemon start skipped: provider is shutting down"
+                    )
+                    return
+            try:
+                if log_path is None:
+                    log_dir = get_hermes_home() / "logs"
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    log_path = log_dir / "hindsight-embed.log"
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n=== Daemon startup failed: {e} ===\n")
+                    traceback.print_exc(file=f)
+            except Exception:
+                logger.warning("Hindsight daemon startup failed: %s", e, exc_info=True)
+        finally:
+            if token is not None:
+                self._finish_client_operation(token)
+
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
@@ -1844,46 +1910,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._mode = "disabled"
                 return
 
-            def _start_daemon():
-                import traceback
-                log_dir = get_hermes_home() / "logs"
-                log_dir.mkdir(parents=True, exist_ok=True)
-                log_path = log_dir / "hindsight-embed.log"
-                try:
-                    # Redirect the daemon manager's Rich console to our log file
-                    # instead of stderr. This avoids global fd redirects that
-                    # would capture output from other threads.
-                    import hindsight_embed.daemon_embed_manager as dem
-                    from rich.console import Console
-                    dem.console = Console(file=open(log_path, "a", encoding="utf-8"), force_terminal=False)
-
-                    client = self._get_client()
-                    profile = self._config.get("profile", "hermes")
-
-                    # Update the profile .env to match our current config so
-                    # the daemon always starts with the right settings.
-                    # If the config changed and the daemon is running, stop it.
-                    profile_env = _embedded_profile_env_path(self._config)
-                    expected_env = _build_embedded_profile_env(self._config)
-                    saved = _load_simple_env(profile_env)
-                    config_changed = saved != expected_env
-
-                    if config_changed:
-                        profile_env = _materialize_embedded_profile_env(self._config)
-                        if client._manager.is_running(profile):
-                            with open(log_path, "a", encoding="utf-8") as f:
-                                f.write("\n=== Config changed, restarting daemon ===\n")
-                            client._manager.stop(profile)
-
-                    client._ensure_started()
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        f.write("\n=== Daemon started successfully ===\n")
-                except Exception as e:
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        f.write(f"\n=== Daemon startup failed: {e} ===\n")
-                        traceback.print_exc(file=f)
-
-            t = threading.Thread(target=_start_daemon, daemon=True, name="hindsight-daemon-start")
+            t = threading.Thread(
+                target=self._start_local_daemon_background,
+                daemon=True,
+                name="hindsight-daemon-start",
+            )
             t.start()
 
     def system_prompt_block(self) -> str:
