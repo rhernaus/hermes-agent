@@ -1157,9 +1157,30 @@ def build_turn_context(
     # Skip prefetch on trivial prompts (greetings, acknowledgements) to
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
+    codex_rich_wire_text: Optional[str] = None
+    if (
+        agent.api_mode == "codex_app_server"
+        and 0 <= current_turn_user_idx < len(messages)
+    ):
+        rich_content = messages[current_turn_user_idx].get("content")
+        if not isinstance(rich_content, str):
+            # Use the exact text/image-placeholder flattening that the Codex
+            # transport applies at turn/start. This gives recall a meaningful
+            # current query and lets the Codex-only sidecar stay byte-exact.
+            from agent.transports.codex_app_server_session import (
+                _coerce_turn_input_text,
+            )
+
+            codex_rich_wire_text = _coerce_turn_input_text(rich_content)
     if agent._memory_manager:
         try:
-            _query = original_user_message if isinstance(original_user_message, str) else ""
+            _query = (
+                codex_rich_wire_text
+                if codex_rich_wire_text is not None
+                else original_user_message
+                if isinstance(original_user_message, str)
+                else ""
+            )
             if not is_trivial_prompt(_query):
                 ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
@@ -1187,8 +1208,11 @@ def build_turn_context(
         and messages[current_turn_user_idx].get("role") == "user"
     ):
         _turn_user_msg = messages[current_turn_user_idx]
+        _composition_content = _turn_user_msg.get("content", "")
+        if codex_rich_wire_text is not None:
+            _composition_content = codex_rich_wire_text
         _api_content = compose_user_api_content(
-            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+            _composition_content, ext_prefetch_cache, plugin_user_context
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content

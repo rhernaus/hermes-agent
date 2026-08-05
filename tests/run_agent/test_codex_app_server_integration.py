@@ -114,6 +114,7 @@ class TestRunConversationCodexPath:
         )
         memory_manager = MagicMock()
         memory_manager.prefetch_all.return_value = "current-query memory"
+        memory_manager.build_system_prompt.return_value = ""
         agent._memory_manager = memory_manager
 
         with patch(
@@ -153,6 +154,87 @@ class TestRunConversationCodexPath:
             if m["role"] == "user"
         )
         assert replayed_user["content"] == "what matters now?"
+        assert replayed_user["api_content"] == expected
+
+    def test_first_codex_call_flattens_rich_query_and_persists_wire_sidecar(
+        self, monkeypatch, tmp_path
+    ):
+        captured_inputs = []
+
+        def fake_run_turn(self, user_input, **kwargs):
+            captured_inputs.append(user_input)
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-rich-memory-1",
+                thread_id="thread-rich-memory-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-rich-memory-1",
+        )
+
+        rich_content = [
+            {"type": "text", "text": "compare the release notes"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,abc"},
+            },
+            {"type": "input_text", "content": "focus on test failures"},
+        ]
+        flattened_wire_text = (
+            "compare the release notes\n\n"
+            "[image attached]\n\n"
+            "focus on test failures"
+        )
+        db = SessionDB(tmp_path / "state.db")
+        agent = _make_codex_agent(
+            session_db=db,
+            session_id="codex-rich-current-recall",
+        )
+        memory_manager = MagicMock()
+        memory_manager.prefetch_all.return_value = "rich-query memory"
+        memory_manager.build_system_prompt.return_value = ""
+        agent._memory_manager = memory_manager
+
+        with patch(
+            "hermes_cli.lifecycle.invoke_hook",
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ), patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation(rich_content)
+
+        expected = compose_user_api_content(
+            flattened_wire_text, "rich-query memory", "PLUGIN-CTX"
+        )
+        assert expected is not None
+        memory_manager.prefetch_all.assert_called_once_with(flattened_wire_text)
+        assert captured_inputs == [expected]
+
+        user_message = next(m for m in result["messages"] if m["role"] == "user")
+        assert user_message["content"] == rich_content
+        assert user_message["api_content"] == expected
+
+        user_row = next(
+            row
+            for row in db.get_messages(
+                "codex-rich-current-recall", include_inactive=True
+            )
+            if row["role"] == "user"
+        )
+        assert user_row["content"] == rich_content
+        assert user_row["api_content"] == expected
+
+        replayed_user = next(
+            m
+            for m in db.get_messages_as_conversation(
+                "codex-rich-current-recall"
+            )
+            if m["role"] == "user"
+        )
+        assert replayed_user["content"] == rich_content
         assert replayed_user["api_content"] == expected
 
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
