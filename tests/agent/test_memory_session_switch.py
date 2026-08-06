@@ -196,6 +196,7 @@ def _make_hindsight_provider():
     # writer-queue wiring is in place.
     import queue as _queue
     provider._retain_queue = _queue.Queue()
+    provider._retain_admission_lock = threading.Lock()
     provider._shutting_down = threading.Event()
     provider._atexit_registered = True
     provider._ensure_writer = lambda: None
